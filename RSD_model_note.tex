@@ -1,0 +1,662 @@
+\documentclass[preprint,numbers,1p]{elsarticle}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{listings}
+\usepackage{geometry}
+
+\geometry{margin=2.5cm}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  language=C++,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+}
+
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{Physics Model of the DC-RSD Surface Simulator (\texttt{DCRSD\_SurfaceSimulator.c})}
+
+\author{N. Cartiglia, INFN, Torino}
+
+\begin{abstract}
+This note documents the physics model implemented in \texttt{DCRSD\_SurfaceSimulator.c},
+a ROOT-based GUI simulation for DC-coupled Resistive Silicon Detectors (RSD) with a $4\times4$ pixel
+layout and optional resistive strips. The simulation solves the Kirchhoff current law (KCL)
+on a sparse resistive network, models charge sharing via pixel templates, reconstructs
+particle positions with a $\chi^2$ minimiser with Student's $t$ and Gaussian resolution fits,
+provides inter-electrode resistance measurements through a Kelvin two-terminal method,
+quantifies signal leakage to outer pixels, and supports both fixed laser charge and
+MIP Landau charge fluctuation modes. All model parameters are controlled interactively
+through a ROOT GUI.
+\end{abstract}
+
+\begin{keyword}
+Resistive Silicon Detector \sep Resistive sheet \sep Charge sharing \sep Position resolution \sep ROOT simulation
+\end{keyword}
+
+\end{frontmatter}
+
+%--------------------------------------------------------------------
+\section{Overview}
+\label{sec:overview}
+%--------------------------------------------------------------------
+
+The simulation models a $4\times4$ array of RSD pixels as a two-dimensional resistive network
+on a uniform rectangular grid. Each grid node represents a small patch of the detector surface.
+An ionising particle deposits charge at a given position; the charge then spreads through the
+resistive layer and is collected by the pixel electrodes. The collected signals are used to
+reconstruct the hit position.
+
+The main simulation parameters are listed in Table~\ref{tab:params}.
+
+\begin{table}[h]
+\centering
+\caption{GUI-controllable simulation parameters.}
+\label{tab:params}
+\begin{tabular}{lllr}
+\toprule
+Parameter & Symbol & Unit & Default \\
+\midrule
+Pixel pitch & $p$ & \si{\micro\meter} & 500 \\
+Surface resistivity & $\rho_s$ & $\Omega/\square$ & 1000 \\
+Strip resistivity at pad & $\rho_{s,\mathrm{pad}}$ & $\Omega/\square$ & 25 \\
+Strip resistivity at mid & $\rho_{s,\mathrm{mid}}$ & $\Omega/\square$ & 25 \\
+Strip gap at midpoint & $g_\mathrm{mid}$ & \si{\micro\meter} & 0 \\
+Strip gap at pad & $g_\mathrm{pad}$ & \si{\micro\meter} & 0 \\
+Pad radius & $a$ & \si{\micro\meter} & 60 \\
+Input impedance & $R_\mathrm{in}$ & \si{\ohm} & 50 \\
+Noise RMS & $\sigma_n$ & (normalised) & 0.018 \\
+Scan steps per pixel & $n_s$ & -- & 100 \\
+Events for template reco & $N_\mathrm{ev}$ & -- & 5000 \\
+Trench between pixels & -- & boolean & false \\
+No structure (surface only) & -- & boolean & false \\
+MIP Landau charge & -- & boolean & false \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%--------------------------------------------------------------------
+\section{Grid and Coordinate System}
+\label{sec:grid}
+%--------------------------------------------------------------------
+
+The simulation domain covers a $3p \times 3p$ area centred on a $3\times3$ sub-array of the
+$4\times4$ layout. The grid has $n = 301$ nodes along each axis, giving a node pitch (mesh
+size) of
+\begin{equation}
+  h = \frac{3p}{n-1} = \frac{3p}{300}.
+\end{equation}
+For the default pitch $p = \SI{500}{\micro\meter}$ this gives $h = \SI{5}{\micro\meter}$ per
+node. The pixel pitch occupies $p/h = 100$ nodes.
+
+Node $(i,j)$ has physical coordinates
+\begin{align}
+  x_{ij} &= j \cdot h, & y_{ij} &= i \cdot h,
+\end{align}
+with $i,j \in \{0,\ldots,300\}$. The scalar node index is $\mathrm{idx} = i \cdot n + j$.
+The total number of nodes is $N_\mathrm{tot} = n^2 = 90601$.
+
+The four pixel electrodes in the central $2\times2$ sub-array are located at
+$(r,c)\,p$ with $r,c\in\{1,2\}$ (using 0-based row/column index from 0 to 3). All 16 pad
+positions are defined analogously.
+
+%--------------------------------------------------------------------
+\section{Resistive Network Model}
+\label{sec:network}
+%--------------------------------------------------------------------
+
+\subsection{Edge conductance}
+\label{sec:edge}
+
+Each pair of adjacent nodes $(i,j)$ and $(i',j')$ is connected by an edge conductance
+$g_{ij\to i'j'}$ that reflects the local material properties. Three contributions are
+distinguished:
+
+\paragraph{Surface resistive layer}
+The resistive surface layer has a uniform surface resistivity $\rho_s$. For a square of side $h$
+the surface conductance is
+\begin{equation}
+  g_\mathrm{surf} = \frac{1}{R_\mathrm{surf}}, \qquad
+  R_\mathrm{surf} = \rho_s.
+\end{equation}
+(One square contributes $\rho_s$ regardless of $h$.)
+
+\paragraph{Resistive strip}
+Along certain inter-electrode paths a metallic strip with lower resistivity can be present.
+The strip occupies a band of width $w_\mathrm{strip} = 2\times0.025\,p = 0.05\,p$ centred on
+the electrode row or column. Within this band the strip conductance is added in parallel to the
+surface:
+\begin{equation}
+  g = g_\mathrm{surf} + g_\mathrm{strip}, \qquad
+  g_\mathrm{strip} = \frac{1}{r_\mathrm{strip}(d)},
+\end{equation}
+where $d$ is the distance of the edge midpoint from the nearest pad, and $r_\mathrm{strip}$
+is the local strip sheet resistance interpolated linearly between its value at the pad
+$(\rho_{s,\mathrm{pad}})$ and its value at the mid-point $(\rho_{s,\mathrm{mid}})$:
+\begin{equation}
+  r_\mathrm{strip}(d) = \rho_{s,\mathrm{pad}} + (\rho_{s,\mathrm{mid}} - \rho_{s,\mathrm{pad}})
+  \frac{2d}{p}.
+\end{equation}
+
+Two gap regions suppress the strip contribution (returning only surface conductance):
+\begin{itemize}
+  \item \textbf{Midpoint gap} $g_\mathrm{mid}$: edges within half-width $g_\mathrm{mid}/2$ of
+        the inter-electrode midpoint ($d = p/2$) carry only surface conductance.
+  \item \textbf{Pad gap} $g_\mathrm{pad}$: edges within distance $g_\mathrm{pad}$ of any
+        electrode ($d < g_\mathrm{pad}$) carry only surface conductance. This models a strip
+        that ends before reaching the electrode, decoupling the strip from the electrode and
+        increasing the effective inter-electrode resistance without degrading position resolution.
+\end{itemize}
+
+The number of squares from pad to pad along the strip (with no gaps) is
+\begin{equation}
+  N_\square = \frac{p}{w_\mathrm{strip}} = \frac{p}{0.05\,p} = 20.
+\end{equation}
+The total resistance from pad to pad is
+\begin{equation}
+  R_\mathrm{strip,total} = \frac{N_\square}{2}(\rho_{s,\mathrm{pad}} + \rho_{s,\mathrm{mid}})
+  = 10\,(\rho_{s,\mathrm{pad}} + \rho_{s,\mathrm{mid}}).
+\end{equation}
+Due to the two-dimensional nature of the resistive network a correction factor of approximately
+$1.7\times$ is observed with respect to the naive 1D (five-lane parallel) estimate.
+
+\paragraph{Trench}
+When the trench option is active, all strip-related conductance is suppressed and edges crossing
+the inter-electrode boundaries are cut (zero conductance), except within a small radius around
+each electrode. Both cardinal edges (purely horizontal or purely vertical) and diagonal edges
+that cross a boundary are blocked; diagonal edges were historically omitted and represented a
+source of small trench leakage. Only the surface contribution remains on non-trench edges. This
+models an etched gap that completely interrupts current flow between pixels.
+
+\paragraph{No structure (surface only)}
+When the ``No structure'' option is active, the strip gap at midpoint is set equal to the full
+pixel pitch $p$. Because the gap half-width $g_\mathrm{mid}/2 = p/2$ covers every inter-electrode
+position, the strip contribution is suppressed everywhere and the surface behaves as a pure
+uniform resistive surface. The strip resistance entries are disabled in the GUI to prevent
+accidental modification. This mode is equivalent to a detector with no resistive strips and no
+trench.
+
+\subsection{KCL matrix assembly}
+\label{sec:kcl}
+
+The resistive network is described by the Kirchhoff Current Law (KCL) at every node. Denoting
+the node voltage vector as $\mathbf{V}$ and the injected current vector as $\mathbf{B}$, the
+system to be solved is
+\begin{equation}
+  \mathbf{M}\,\mathbf{V} = \mathbf{B},
+\end{equation}
+where $\mathbf{M}$ is the $N_\mathrm{tot}\times N_\mathrm{tot}$ sparse conductance (Laplacian)
+matrix. Its off-diagonal entries are
+\begin{equation}
+  M_{\mathrm{idx},\,\mathrm{idx}'} = -g_{\mathrm{idx}\to\mathrm{idx}'},
+\end{equation}
+and the diagonal entries are the sum of all conductances leaving node $\mathrm{idx}$:
+\begin{equation}
+  M_{\mathrm{idx},\mathrm{idx}} = \sum_{\mathrm{neighbours}\,k} g_{\mathrm{idx}\to k}
+  + \Delta_\mathrm{diag},
+\end{equation}
+where $\Delta_\mathrm{diag}$ is an additional diagonal term used to enforce boundary conditions
+(see Section~\ref{sec:bc}).
+
+\subsection{Boundary conditions at pads}
+\label{sec:bc}
+
+Two operating modes are available, selected by the input impedance $R_\mathrm{in}$:
+
+\paragraph{$R_\mathrm{in} = 0$ (direct ground).}
+Each pad node is forced to $V = 0$ by setting its diagonal entry to unity and leaving all
+off-diagonal entries in that row at zero:
+\begin{equation}
+  M_{\mathrm{pad},\mathrm{pad}} = 1, \qquad
+  M_{\mathrm{pad},k} = 0 \; \forall\, k\neq \mathrm{pad}, \qquad
+  B_\mathrm{pad} = 0.
+\end{equation}
+This is equivalent to a short circuit to ground without requiring a large penalty conductance.
+
+\paragraph{$R_\mathrm{in} > 0$ (floating pad with input impedance).}
+The pad is not pinned; instead an additional conductance $1/R_\mathrm{in}$ is added between
+the pad node and ground:
+\begin{equation}
+  M_{\mathrm{pad},\mathrm{pad}} \mathrel{+}= \frac{1}{R_\mathrm{in}}, \qquad
+  B_\mathrm{pad} = 0.
+\end{equation}
+The collected current is then $I_k = V_k / R_\mathrm{in}$.
+
+A high $R_\mathrm{in}$ isolates the readout electronics from the resistive strip while
+preserving the charge-sharing structure needed for position reconstruction. The
+inter-electrode resistance (Section~\ref{sec:resistance}) is independent of $R_\mathrm{in}$,
+as it is measured with all pads floating.
+
+\subsection{Matrix decomposition and caching}
+\label{sec:cache}
+
+The KCL matrix depends only on the geometric and material parameters (pitch, resistivities,
+gaps, trench, $R_\mathrm{in}$) and not on the injection position. It is therefore factorised
+once and reused for all injection positions. The decomposition uses \texttt{TDecompSparse}
+(ROOT's sparse LU factoriser).
+
+To avoid repeated decomposition between sessions, the matrix is cached on disk in a
+sub-directory \texttt{rsd\_cache/}. Two cache key formats are used:
+\begin{itemize}
+  \item Without trench: \texttt{PP\{p\}\_Rsh\{$\rho_s$\}\_RsP\{$\rho_{s,P}$\}\_RsM\{$\rho_{s,M}$\}\_gap\{$g_\mathrm{mid}$\}\_gapP\{$g_\mathrm{pad}$\}\_tr0\_Rin\{$R_\mathrm{in}$\}\_Rpad\{$a$\}}
+  \item With trench: \texttt{PP\{p\}\_Rsh\{$\rho_s$\}\_tr1\_Rin\{$R_\mathrm{in}$\}\_Rpad\{$a$\}} (strip parameters omitted as they have no effect)
+\end{itemize}
+On loading, the matrix is restored using the \texttt{TMatrixDSparse} copy constructor to
+avoid ROOT's incompatibility check in the assignment operator.
+
+%--------------------------------------------------------------------
+\section{Signal Generation and Collection}
+\label{sec:signal}
+%--------------------------------------------------------------------
+
+\subsection{Charge injection and fluctuation model}
+\label{sec:injection}
+
+A particle crossing the detector at position $(x_0, y_0)$ is modelled as a point current source
+injected at the single nearest grid node, found by rounding to the closest integer node index:
+\begin{equation}
+  B_\mathrm{idx} = L \cdot I_\mathrm{total}, \qquad
+  \mathrm{idx} = \mathrm{round}(x_0/h)\cdot n + \mathrm{round}(y_0/h),
+\end{equation}
+where $I_\mathrm{total} = 1$ (normalised) and $L$ is the amplitude factor described below.
+
+\paragraph{Charge fluctuation modes.}
+The GUI checkbox \emph{MIP Landau charge (laser = off)} controls the amplitude factor $L$:
+
+\begin{itemize}
+  \item \textbf{Laser mode} ($L=1$): the injected charge is fixed, corresponding to a laser
+        pulse of constant intensity. All amplitude variation comes from electronics noise only.
+  \item \textbf{MIP Landau mode}: $L$ is drawn from a Landau distribution with most-probable
+        value $\mathrm{MPV}=1$ and scale $\sigma_L = 0.3$, independently for each simulated
+        event:
+        \begin{equation}
+          L \sim \mathrm{Landau}(\mathrm{MPV}=1,\,\sigma_L=0.3).
+        \end{equation}
+        The noise is added to the signal \emph{after} scaling:
+        \begin{equation}
+          \hat{f}_k = L\cdot f_k(x,y) + \mathcal{N}(0,\sigma_n).
+        \end{equation}
+        The Landau fluctuations produce events with very small signal amplitude ($L \ll 1$),
+        where the noise-to-signal ratio is large and position reconstruction fails.
+        This results in heavy-tailed residual distributions qualitatively similar to those
+        observed with MIP particles in test-beam data.
+\end{itemize}
+
+\subsection{Current collection}
+\label{sec:collection}
+
+After solving $\mathbf{M}\,\mathbf{V} = \mathbf{B}$, the current collected by pad $k$ is
+computed as the net outflow from the pad node. Two formulas apply:
+
+\begin{itemize}
+  \item $R_\mathrm{in} = 0$: $I_k = \sum_{\mathrm{neighbours}\,m} g_{k\to m}(V_k - V_m)$
+        (KCL edge sum).
+  \item $R_\mathrm{in} > 0$: $I_k = V_k / R_\mathrm{in}$.
+\end{itemize}
+
+The fractional sharing for pixel $k$ is $f_k = I_k / \sum_j I_j$.
+
+%--------------------------------------------------------------------
+\section{Transient Signal Propagation}
+\label{sec:transient}
+%--------------------------------------------------------------------
+
+An optional transient model propagates the signal in time. Each node has a capacitance
+\begin{equation}
+  C_\mathrm{node} = \frac{\varepsilon_0\,\varepsilon_\mathrm{Si}\,h^2}{d_\mathrm{Si}},
+\end{equation}
+where $d_\mathrm{Si}$ is the silicon thickness and $h$ is the node pitch. The time step is
+$\Delta t = \SI{20}{\pico\second}$. At each time step the node voltages evolve according to the
+RC equation:
+\begin{equation}
+  C_\mathrm{node}\,\frac{dV_k}{dt} = -\sum_m g_{k\to m}(V_k - V_m) + B_k(t).
+\end{equation}
+This is integrated with a forward-Euler scheme.
+
+Signal propagation delays are also computed geometrically using a Dijkstra--Fermat
+shortest-path algorithm on the resistive network, giving the time for a wavefront to travel
+from the injection point to each pixel electrode.
+
+%--------------------------------------------------------------------
+\section{Validity of the Quasi-Static Approximation}
+\label{sec:quasistatic}
+%--------------------------------------------------------------------
+
+The simulation solves a static (DC) resistive network. Real detector signals from
+LGAD/RSD devices are short current pulses with significant spectral content between
+approximately \SI{50}{MHz} and \SI{400}{MHz}. This section quantifies the error
+introduced by neglecting the finite-frequency response of the resistive sheet.
+
+\subsection{Bulk capacitive shunting}
+\label{sec:bulk_cap}
+
+At frequency $\omega = 2\pi f$, each node of the resistive sheet is capacitively
+coupled to the back-plane electrode through the silicon bulk. The capacitance per unit area is
+\begin{equation}
+  C_\mathrm{bulk} = \frac{\varepsilon_0\,\varepsilon_\mathrm{Si}}{d_\mathrm{Si}},
+\end{equation}
+where $\varepsilon_\mathrm{Si} = 11.7$ and $d_\mathrm{Si}$ is the detector thickness.
+This shunt admittance modifies the 2D resistive diffusion equation into a
+Helmholtz-type equation for the sheet potential:
+\begin{equation}
+  \nabla^2 V - \frac{j\omega\,C_\mathrm{bulk}}{\rho_s^{-1}}\,V = -\rho_s\,j_\mathrm{inj},
+\end{equation}
+where $j_\mathrm{inj}$ is the injected current density.
+Solutions decay with a complex \emph{AC spreading length}
+\begin{equation}
+  \lambda_\mathrm{AC} = \frac{1}{\sqrt{j\omega\,C_\mathrm{bulk}\,\rho_s}},
+  \qquad
+  |\lambda_\mathrm{AC}| = \frac{1}{\sqrt{\omega\,C_\mathrm{bulk}\,\rho_s}}.
+\end{equation}
+The DC limit corresponds to $|\lambda_\mathrm{AC}| \to \infty$. The fractional correction
+to the signal sharing at distance $p$ from the injection point is of order
+$(p/|\lambda_\mathrm{AC}|)^2$.
+
+\subsection{Numerical estimates}
+\label{sec:quasistatic_numbers}
+
+For a typical DC-RSD detector with $d_\mathrm{Si} = \SI{300}{\micro\meter}$ and
+$\rho_s = \SI{1000}{\ohm/\square}$:
+\begin{equation}
+  C_\mathrm{bulk} = \frac{8.85\times10^{-12}\times 11.7}{300\times10^{-6}}
+  \approx \SI{3.45e-8}{F/m^2}.
+\end{equation}
+Table~\ref{tab:lambda} lists $|\lambda_\mathrm{AC}|$ and the corresponding sharing
+correction for a pixel pitch $p = \SI{450}{\micro\meter}$.
+
+\begin{table}[h]
+\centering
+\caption{AC spreading length and fractional correction to signal sharing
+  for $\rho_s = \SI{1000}{\ohm/\square}$, $d_\mathrm{Si} = \SI{300}{\micro\meter}$,
+  $p = \SI{450}{\micro\meter}$.}
+\label{tab:lambda}
+\begin{tabular}{rrrr}
+\toprule
+$f$ & $|\lambda_\mathrm{AC}|$ & $p/|\lambda_\mathrm{AC}|$ & Correction $(p/\lambda)^2$ \\
+\midrule
+\SI{50}{MHz}  & \SI{9.6}{mm}  & 0.047 & $\sim 0.2\%$ \\
+\SI{100}{MHz} & \SI{6.8}{mm}  & 0.066 & $\sim 0.4\%$ \\
+\SI{200}{MHz} & \SI{4.8}{mm}  & 0.094 & $\sim 0.9\%$ \\
+\SI{400}{MHz} & \SI{3.4}{mm}  & 0.13  & $\sim 1.7\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Since $|\lambda_\mathrm{AC}| \gg p$ across the full signal bandwidth, the spatial
+distribution of collected charge is virtually indistinguishable from the DC case.
+
+\subsection{Strip RC time constant}
+\label{sec:strip_rc}
+
+The resistive strips (Section~\ref{sec:edge}) have a typical resistance
+$R_\mathrm{strip} \sim 500\,\Omega$ for the pad-to-pad path. Their self-capacitance
+to the back-plane is negligible ($C_\mathrm{strip} \sim \SI{0.1}{fF}$), giving a
+characteristic frequency
+\begin{equation}
+  f_\mathrm{3dB} = \frac{1}{2\pi\,R_\mathrm{strip}\,C_\mathrm{strip}} \sim \SI{3}{THz},
+\end{equation}
+which is far above the signal bandwidth. The strip impedance is therefore purely
+resistive at all relevant frequencies.
+
+\subsection{Conclusion}
+\label{sec:quasistatic_conclusion}
+
+The quasi-static (DC) approximation is valid for DC-RSD signal sharing at frequencies
+up to at least \SI{400}{MHz}. The maximum fractional error in signal sharing is
+$\lesssim 2\%$ over the full LGAD/RSD signal bandwidth, well below the level of
+noise and other systematic effects. No frequency-dependent correction to the
+resistive network model is required under typical detector parameters.
+
+%--------------------------------------------------------------------
+\section{Charge Sharing Templates}
+\label{sec:templates}
+%--------------------------------------------------------------------
+
+The sharing template describes how the collected charge fraction $f_k(x,y)$ varies as a
+function of the hit position $(x,y)$ within the central pixel cell. Templates are computed on
+a $(n_s+1)\times(n_s+1)$ grid spanning one pixel pitch in each direction, with step size
+$\Delta x = p/n_s$. The GUI parameter $n_s$ (default 100) sets the number of scan steps per
+pixel; at the default, $\Delta x = h$ (one grid node per step). For each scan point the KCL
+system is solved and the fractions $\{f_k\}$ for all 16 pixels are stored. The resulting
+$f_k(x,y)$ maps are displayed as 2D colour histograms (\texttt{TH2D}) with $z$ range $[0,1]$.
+
+%--------------------------------------------------------------------
+\section{Signal Leakage}
+\label{sec:leakage}
+%--------------------------------------------------------------------
+
+For a hit inside the central pixel cell $[p,2p]\times[p,2p]$, the signal collected by the
+four central pixels (P6, P7, P10, P11) should ideally equal the total injected signal. Any
+current reaching the 12 outer pixels constitutes \emph{signal leakage}:
+\begin{equation}
+  \mathcal{L}(x,y) = 1 - \frac{I_6 + I_7 + I_{10} + I_{11}}{I_\mathrm{total}}.
+\end{equation}
+The leakage map is computed over the central pixel cell by scanning at intervals of $\Delta x$
+and displayed alongside the central-pad fraction map. The surface-averaged leakage,
+\begin{equation}
+  \langle\mathcal{L}\rangle = \frac{1}{N_\mathrm{bins}}\sum_{\mathrm{bins}} \mathcal{L}(x,y),
+\end{equation}
+is printed to the terminal after the scan. The two maps share the same scan and are computed
+simultaneously without additional solver calls.
+
+Leakage is largest near the pixel boundaries, where the signal is shared between pixels, and
+is enhanced when a resistive strip at low resistivity provides a direct current path to outer
+electrodes. The combination of a high $R_\mathrm{in}$ with a pad gap $g_\mathrm{pad}$ reduces
+leakage while preserving the position resolution.
+
+%--------------------------------------------------------------------
+\section{Position Reconstruction}
+\label{sec:reco}
+%--------------------------------------------------------------------
+
+\subsection{Template-based $\chi^2$ minimisation}
+\label{sec:chi2}
+
+Given a measured set of signal fractions $\{\hat{f}_k\}$ (with Gaussian noise of RMS
+$\sigma_n$ added), the reconstructed position $(\hat{x}, \hat{y})$ is found by minimising
+\begin{equation}
+  \chi^2(x,y) = \sum_{k \in \{6,7,10,11\}} [\hat{f}_k - f_k(x,y)]^2,
+\end{equation}
+where the sum runs over the \textbf{four central pads} only (P6, P7, P10, P11), since the
+templates are built exclusively for these pixels.
+The minimisation scans the $(n_s+1)\times(n_s+1)$ template grid to find the coarse minimum, then applies
+parabolic interpolation in both $x$ and $y$ independently to obtain sub-grid precision:
+\begin{equation}
+  x^* = x_m - \frac{1}{2}\,\frac{\chi^2_{m+1} - \chi^2_{m-1}}{\chi^2_{m+1} - 2\chi^2_m + \chi^2_{m-1}}\,\Delta x.
+\end{equation}
+Parabolic interpolation removes the scan-direction bias that would otherwise produce an
+asymmetric $x$-residual distribution.
+
+\subsection{Noiseless reconstruction and distortion grid}
+\label{sec:noiseless}
+
+Before the noisy event loop, a noiseless reconstructed position is computed analytically:
+\begin{align}
+  x_\mathrm{nl} &= p\cdot\frac{3}{2} + \frac{(f_{10}+f_{11})-(f_6+f_7)}{f_6+f_7+f_{10}+f_{11}}\,\frac{p}{2}, \\
+  y_\mathrm{nl} &= p\cdot\frac{3}{2} + \frac{(f_7+f_{11})-(f_6+f_{10})}{f_6+f_7+f_{10}+f_{11}}\,\frac{p}{2},
+\end{align}
+using the unbalance formula with noiseless amplitudes. The noiseless reconstruction is used
+to populate the \emph{distortion grid} ($x_\mathrm{true}$ vs $x_\mathrm{nl}$) as a scatter
+plot, which shows the systematic nonlinearity of the unbalance estimator without contamination
+from noise. A separate noisy realisation is used to build the distortion map displayed as a
+2D histogram.
+
+\subsection{Resolution map}
+\label{sec:resmap}
+
+The position resolution is evaluated by generating $N_\mathrm{ev}$ random hit positions uniform
+in $[p, 2p] \times [p, 2p]$ (the central pixel cell). For each hit the reconstruction error is
+$\epsilon_x = \hat{x} - x_\mathrm{true}$. The RMS resolution map is computed on a
+$(n_s+1)\times(n_s+1)$ grid, where each bin accumulates the squared errors:
+\begin{equation}
+  \sigma_x(x,y) = \sqrt{\frac{1}{N_\mathrm{bin}}\sum_{i\in\mathrm{bin}} \epsilon_{x,i}^2}.
+\end{equation}
+This definition includes both the statistical spread and any residual bias; it is equivalent
+to the root-mean-square position error. The $z$ scale is fixed at $[0, \SI{20}{\micro\meter}]$.
+
+\subsection{Resolution fits}
+\label{sec:fits}
+
+The global $x$-residual distribution $\Delta x = \hat{x} - x_\mathrm{true}$ is fitted with
+two models displayed in separate panels:
+
+\paragraph{Gaussian fit.}
+A standard Gaussian $\mathcal{N}(\mu,\sigma)$ is fitted to extract the core resolution
+$\sigma$.
+
+\paragraph{Student's $t$ fit.}
+A Student's $t$ distribution with location $\mu$, scale $\sigma_\mathrm{scale}$, and
+$\nu$ degrees of freedom is fitted over the range $[-\SI{100}{\micro\meter},\,+\SI{100}{\micro\meter}]$:
+\begin{equation}
+  f(x;\,\mu,\sigma_\mathrm{scale},\nu) =
+  \frac{1}{\sigma_\mathrm{scale}}\,
+  t\!\left(\frac{x-\mu}{\sigma_\mathrm{scale}};\,\nu\right),
+\end{equation}
+where $t(z;\nu)$ is the standard Student's $t$ density implemented via
+\texttt{TMath::Student}. For $\nu > 2$ the true standard deviation of the distribution is
+\begin{equation}
+  \sigma_\mathrm{RMS} = \sigma_\mathrm{scale}\sqrt{\frac{\nu}{\nu-2}}.
+\end{equation}
+The $t$ distribution accounts for heavy tails arising from ambiguous template matches near
+pixel boundaries and from Landau amplitude fluctuations (MIP mode). As $\nu\to\infty$ it
+converges to the Gaussian. Fit parameters
+($\sigma_\mathrm{scale}$, $\nu$, $\sigma_\mathrm{RMS}$) are reported on the terminal.
+
+\subsection{Canvas layouts}
+\label{sec:linearity}
+
+\paragraph{Unbalance analysis (canvas c3, $2\times2$).}
+\begin{enumerate}
+  \item[P1] \textbf{Distortion grid}: scatter of noiseless reconstructed positions
+        $(x_\mathrm{nl}, y_\mathrm{nl})$ over the central pixel cell, showing the systematic
+        nonlinearity of the unbalance estimator.
+  \item[P2] \textbf{2D RMS resolution map}: $\sigma_x(x,y)$ on a $(n_s+1)\times(n_s+1)$ grid ($z$ range
+        $[0, \SI{20}{\micro\meter}]$).
+  \item[P3] \textbf{1D residuals} $\Delta x = \hat{x} - x_\mathrm{true}$, fitted with a
+        Student's $t$ distribution. Fit parameters printed to the terminal.
+  \item[P4] \textbf{X linearity scatter}: $x_\mathrm{true}$ vs.\ $x_\mathrm{nl}$ (noiseless),
+        one point per scan grid position. Dashed red diagonal at $x_\mathrm{reco}=x_\mathrm{true}$.
+\end{enumerate}
+
+\paragraph{Template reconstruction analysis (canvas c5, $3\times2$).}
+The canvas is divided into six panels ($3$ columns $\times$ $2$ rows):
+\begin{enumerate}
+  \item[P1] \textbf{Reconstructed position density}: 2D histogram of $(x_\mathrm{reco},
+        y_\mathrm{reco})$ for all accepted events.
+  \item[P2] \textbf{2D RMS resolution map}: same definition as in c3 ($z$ range
+        $[0, \SI{30}{\micro\meter}]$).
+  \item[P3] \textbf{RMS($\Delta x$) vs.\ $X_\mathrm{true}$}: 1D projection of the resolution
+        map integrated over $Y$, with error bars $\sigma_\mathrm{RMS}/\sqrt{2N}$.
+  \item[P4] \textbf{1D residuals} $\Delta x$ fitted with a Gaussian; $\sigma$ annotated on
+        the pad.
+  \item[P5] \textbf{1D residuals} (clone) fitted with a Student's $t$ distribution;
+        $\sigma_\mathrm{scale}$, $\nu$, and $\sigma_\mathrm{RMS}$ reported on the terminal.
+  \item[P6] \textbf{X linearity scatter}: $x_\mathrm{true}$ vs.\ $x_\mathrm{reco}$ (with
+        noise), one point per event. Dashed red diagonal overlaid.
+\end{enumerate}
+
+Nonlinearity is an intrinsic feature of the unbalance estimator near pixel boundaries, where
+the charge sharing changes rapidly. The linearity plot provides a direct visualisation of the
+estimator's accuracy independent of the noise level.
+
+%--------------------------------------------------------------------
+\section{Inter-electrode Resistance Measurement}
+\label{sec:resistance}
+%--------------------------------------------------------------------
+
+The effective resistance between two pixel electrodes is measured using a Kelvin (two-terminal)
+method. For each pair of pads $(P_a, P_b)$ to be measured:
+
+\begin{enumerate}
+  \item Build the free KCL matrix with all pad nodes floating (no boundary conditions applied to pads). This matrix is independent of $R_\mathrm{in}$.
+  \item Add a weak reference conductance $G_\mathrm{ref} = 10^{-9}$ to node 0 to remove the
+        singular null mode:
+        \begin{equation}
+          M_{0,0} \mathrel{+}= G_\mathrm{ref}.
+        \end{equation}
+  \item Set the right-hand side $\mathbf{B}$ with $B(P_a) = +1$ (current source) and
+        $B(P_b) = -1$ (current sink).
+  \item Solve $\mathbf{M}\,\mathbf{V} = \mathbf{B}$.
+  \item The inter-electrode resistance is $R_{ab} = V(P_a) - V(P_b)$.
+\end{enumerate}
+
+This approach leaves all other pads floating so that their presence does not short-circuit the
+measurement path. Two measurements are performed:
+
+\begin{itemize}
+  \item $R_\mathrm{side}$: pixel $P_{11}$ (row 2, col 2) to $P_7$ (row 1, col 2) --- side neighbours.
+  \item $R_\mathrm{diag}$: pixel $P_{11}$ (row 2, col 2) to $P_6$ (row 1, col 1) --- diagonal neighbours.
+\end{itemize}
+
+In a pure 2D resistive sheet the resistance between two electrodes scales logarithmically with
+their separation, so the ratio $R_\mathrm{diag}/R_\mathrm{side}$ is
+expected to be slightly above unity:
+\begin{equation}
+  \frac{R_\mathrm{diag}}{R_\mathrm{side}} \approx \frac{\ln(\sqrt{2}\,p/a)}{\ln(p/a)},
+\end{equation}
+where $a$ is the effective electrode radius. Numerically this gives a ratio of approximately
+$1.13$--$1.15$, consistent with simulation results.
+
+%--------------------------------------------------------------------
+\section{Summary of Simulation Workflow}
+\label{sec:workflow}
+%--------------------------------------------------------------------
+
+\begin{enumerate}
+  \item \textbf{Grid setup}: generate the $301\times301$ node grid for the chosen pitch $p$.
+  \item \textbf{Matrix build}: assemble the KCL conductance matrix \textbf{M} using
+        \texttt{GetEdgeConductance()} for each of the four neighbour directions at every node.
+        Apply pad boundary conditions according to $R_\mathrm{in}$.
+  \item \textbf{Decomposition}: factorise \textbf{M} with \texttt{TDecompSparse}.
+        Cache the matrix and decomposition on disk using a parameter-encoded file name.
+  \item \textbf{Template scan}: for each of the $(n_s+1)\times(n_s+1)$ scan positions within the central
+        pixel cell, inject current, solve, collect currents, store $\{f_k(x,y)\}$.
+  \item \textbf{Signal leakage scan}: for each scan position in the central pixel cell, compute
+        the fraction of signal reaching outer pixels; report the surface-averaged leakage.
+  \item \textbf{Noiseless reconstruction}: for each scan point compute $x_\mathrm{nl}$, $y_\mathrm{nl}$
+        using the unbalance formula with noiseless amplitudes; populate the linearity scatter plot.
+  \item \textbf{Event loop}: generate $N_\mathrm{ev}$ random hits; optionally draw amplitude factor
+        $L$ from a Landau distribution (MIP mode) or set $L=1$ (laser mode); add Gaussian noise;
+        reconstruct positions via $\chi^2$ minimisation with parabolic interpolation.
+  \item \textbf{Resolution map}: bin reconstruction errors into $(n_s+1)\times(n_s+1)$ map, compute
+        RMS per bin.
+  \item \textbf{Resolution fits}: fit the global $\Delta x$ distribution over $[-100,+100]\,\mu$m
+        with a Gaussian and a Student's $t$ (via \texttt{TMath::Student});
+        report $\sigma$, $\sigma_\mathrm{scale}$, $\nu$, $\sigma_\mathrm{RMS}$.
+  \item \textbf{Linearity}: display $x_\mathrm{true}$ vs $x_\mathrm{reco}$ scatter with diagonal reference.
+  \item \textbf{Resistance}: Kelvin measurement between selected pad pairs (independent of $R_\mathrm{in}$).
+\end{enumerate}
+
+
+%--------------------------------------------------------------------
+\section*{Code and Documentation Availability}
+\label{sec:availability}
+%--------------------------------------------------------------------
+
+The source code \texttt{DCRSD\_SurfaceSimulator.c} and this technical note are publicly
+available on GitHub:
+\begin{center}
+  \url{https://github.com/cartiglia/DCRSD_SS}
+\end{center}
+To download the code, clone the repository with:
+\begin{lstlisting}[language=bash]
+git clone https://github.com/cartiglia/DCRSD_SS.git
+\end{lstlisting}
+The simulator requires ROOT 6 (\url{https://root.cern}) and is run directly as a ROOT macro:
+\begin{lstlisting}[language=bash]
+root DCRSD_SurfaceSimulator.c
+\end{lstlisting}
+
+\end{document}
