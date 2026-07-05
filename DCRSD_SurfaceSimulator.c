@@ -60,6 +60,32 @@ private:
     double Amplitude()  { return fNumAmplitude->GetNumber(); }   // signal amplitude [a.u.]
     const int nTot = n * n;
 
+    // Bilinear charge injection at continuous (x,y) [um] onto the 4 surrounding
+    // grid nodes. Replaces nearest-node rounding (TMath::Nint), which produced a
+    // staircase error of up to half a node pitch, equal in x and y -> diagonal
+    // shift of the exported templates.
+    // padDirect (size 17): with Rin=0 the pad nodes are Dirichlet (V=0) and would
+    // swallow injected charge; weight landing on pad metal is routed directly to
+    // that pad's collected current instead.
+    void InjectBilinear(TVectorD &B, double x, double y, double *padDirect = nullptr) {
+        double gx = x / Pitch(), gy = y / Pitch();
+        int i0 = std::max(0, std::min(n-2, (int)std::floor(gx)));
+        int j0 = std::max(0, std::min(n-2, (int)std::floor(gy)));
+        double fx = std::max(0.0, std::min(1.0, gx - i0));
+        double fy = std::max(0.0, std::min(1.0, gy - j0));
+        const int    ii[4] = { i0, i0+1, i0,   i0+1 };
+        const int    jj[4] = { j0, j0,   j0+1, j0+1 };
+        const double w[4]  = { (1.0-fx)*(1.0-fy), fx*(1.0-fy), (1.0-fx)*fy, fx*fy };
+        bool rin0 = (fNumRin->GetNumber() <= 0.0);
+        for (int k = 0; k < 4; k++) {
+            int idx = ii[k]*n + jj[k];
+            if (rin0 && padDirect && fTypeMap[idx] > 0)
+                padDirect[fTypeMap[idx]] += w[k];
+            else
+                B(idx) += w[k];
+        }
+    }
+
     // --- CACHE ---
     TDecompSparse  *fSolverStatic = nullptr;
     TMatrixDSparse *fMatrixStatic = nullptr; 
@@ -469,10 +495,14 @@ public:
         // Cuts cross-trench bulk edges, but leaves gaps at the electrode pads.
         if (TrenchEnabled()) {
             const double pad_r = PadRadius();
+            // The trench line sits exactly on node row/column k*100. Cut the edges
+            // touching that row from BOTH sides (99<->100 and 100<->101): cutting only
+            // the crossing edge attached the trench row to one pixel and shifted the
+            // whole response by one node pitch along the diagonal.
             if (di == 0) {
-                // Vertical edge: check if it crosses y = 500 or y = 1000
+                // Vertical edge: check if it touches y = 500 or y = 1000
                 for (int k = 1; k <= 2; k++) {
-                    if ((j < k*100) != (j + dj < k*100)) {
+                    if ((j == k*100) != (j + dj == k*100)) {
                         double xmid = i * Pitch();
                         bool near_pad = false;
                         for (int c = 0; c < 4 && !near_pad; c++)
@@ -481,16 +511,16 @@ public:
                     }
                 }
             } else {
-                // Horizontal or diagonal edge: check both x and y boundary crossings
+                // Horizontal or diagonal edge: check both x and y boundary lines
                 for (int k = 1; k <= 2; k++) {
-                    if ((i < k*100) != (i + di < k*100)) {
+                    if ((i == k*100) != (i + di == k*100)) {
                         double ymid = j * Pitch();
                         bool near_pad = false;
                         for (int c = 0; c < 4 && !near_pad; c++)
                             near_pad = std::abs(ymid - c*PP()) <= pad_r;
                         if (!near_pad) return 0.0;
                     }
-                    if (dj != 0 && (j < k*100) != (j + dj < k*100)) {
+                    if (dj != 0 && (j == k*100) != (j + dj == k*100)) {
                         double xmid = i * Pitch();
                         bool near_pad = false;
                         for (int c = 0; c < 4 && !near_pad; c++)
@@ -1389,16 +1419,16 @@ void DoSharingTemplates() {
         for (double y = PP()+step/2.0; y <= PP()*2.0-step/2.0+1e-6; y += step) {
             
             TVectorD B(nTot); B.Zero();
-            { int ii = std::max(0, std::min(n-1, TMath::Nint(x/Pitch())));
-              int jj = std::max(0, std::min(n-1, TMath::Nint(y/Pitch())));
-              B(ii*n + jj) = 1.0; }
-            
-            bool ok; 
+            double padDirect[17] = {0};
+            InjectBilinear(B, x, y, padDirect);
+
+            bool ok;
             TVectorD V = solver->Solve(B, ok);
-            
+
             std::vector<double> cur(17, 0.0);
             double iTot = 0;
             CollectCurrents(V, cur, iTot);
+            for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
 
             // normalize to 1 over the 4 central pads
             double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
@@ -1675,11 +1705,13 @@ void DoSharingTemplates() {
         if (fTypeMap[ii*n + jj] > 0) { nSkippedReco++; continue; }
 
         TVectorD B(nTot); B.Zero();
-        B(ii*n + jj) = 1.0;
+        double padDirect[17] = {0};
+        InjectBilinear(B, x_true, y_true, padDirect);
         bool ok; TVectorD V = solver->Solve(B, ok);
 
         std::vector<double> cur(17, 0.0); double iTot = 0;
         CollectCurrents(V, cur, iTot);
+        for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
 
         int pIDs[4] = {7, 11, 6, 10};
         double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
