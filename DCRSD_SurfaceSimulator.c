@@ -86,6 +86,62 @@ private:
         }
     }
 
+    // --- Sharing-template on-disk cache ---
+    // Own simple text format (nx ny PP header, then "bx by v_p7 v_p11 v_p6 v_p10"
+    // rows), keyed like the matrix cache below plus nx and the amplitude offset
+    // (the two extra parameters the template itself depends on). Shared with
+    // DCRSD_TemplateScan.C's template_cache/ -- a template computed by either
+    // one is reused by the other if the geometry/nx/offset match.
+    TString TemplateCachePath(int nx) {
+        gSystem->mkdir("template_cache", kTRUE);
+        double rsh = fNumRsheet->GetNumber();
+        double rpad = PadRadius();
+        double rin = fNumRin->GetNumber();
+        TString geomKey;
+        if (TrenchEnabled())
+            geomKey = TString::Format("PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f", PP(), rsh, rin, rpad);
+        else
+            geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
+                PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
+                fNumStripGap->GetNumber(), fNumStripGapPad->GetNumber(), rin, rpad);
+        return TString::Format("template_cache/template_%s_nx%d_off%.3f.txt",
+                                geomKey.Data(), nx, fNumAmpOffset->GetNumber());
+    }
+
+    bool LoadTemplateFromDisk(const TString &path, int nx) {
+        std::ifstream f(path.Data());
+        if (!f.is_open()) return false;
+        int fnx, fny; double fpp;
+        f >> fnx >> fny >> fpp;
+        if (fnx != nx || fny != nx) { f.close(); return false; }
+        int pIDs[4] = {7, 11, 6, 10};
+        for (int p = 0; p < 4; p++) {
+            if (fTemplatesReady && fTemplates[p]) delete fTemplates[p];
+            fTemplates[p] = new TH2D(Form("fTemp_%d", pIDs[p]),
+                Form("Sharing Template Pad %d (offset=%.3f);X [um];Y [um]", pIDs[p], fNumAmpOffset->GetNumber()),
+                nx, 0, PP(), nx, 0, PP());
+            fTemplates[p]->SetStats(0);
+        }
+        int bx, by; double v[4];
+        while (f >> bx >> by >> v[0] >> v[1] >> v[2] >> v[3])
+            for (int p = 0; p < 4; p++) fTemplates[p]->SetBinContent(bx, by, v[p]);
+        f.close();
+        return true;
+    }
+
+    void SaveTemplateToDisk(const TString &path, int nx) {
+        std::ofstream f(path.Data());
+        f << nx << " " << nx << " " << PP() << "\n";
+        for (int bx = 1; bx <= nx; bx++)
+            for (int by = 1; by <= nx; by++) {
+                f << bx << " " << by;
+                for (int p = 0; p < 4; p++) f << " " << fTemplates[p]->GetBinContent(bx, by);
+                f << "\n";
+            }
+        f.close();
+        std::cout << ">>> Template saved to cache: " << path << std::endl;
+    }
+
     // --- CACHE ---
     TDecompSparse  *fSolverStatic = nullptr;
     TMatrixDSparse *fMatrixStatic = nullptr; 
@@ -151,11 +207,11 @@ public:
         vCol1->AddFrame(fNumThick, entL);
 
         vCol1->AddFrame(new TGLabel(vCol1, "Pad Radius [um]:"), lblL);
-        fNumPadRadius = new TGNumberEntry(vCol1, 60, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 500);
+        fNumPadRadius = new TGNumberEntry(vCol1, 30, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 500);
         vCol1->AddFrame(fNumPadRadius, entL);
 
         vCol1->AddFrame(new TGLabel(vCol1, "# bins per pixel:"), lblL);
-        fNumScanStep = new TGNumberEntry(vCol1, 100, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 5, 200);
+        fNumScanStep = new TGNumberEntry(vCol1, 50, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 5, 200);
         vCol1->AddFrame(fNumScanStep, entL);
 
         vCol1->AddFrame(new TGLabel(vCol1, "Surface Resistivity [Ohm/sq]:"), lblL);
@@ -1389,67 +1445,76 @@ void DoInjectCharge() {
 
 void DoSharingTemplates() {
     SetStatus("  Computing...  ", true);
-    TDecompSparse *solver = GetSolver(false);
-    int    nx   = (int)fNumScanStep->GetNumber();
-    int    ny   = nx;
-    double step = PP() / nx;
+    int nx = (int)fNumScanStep->GetNumber();
+    int ny = nx;
 
-    double min_ax = 0;
-    double max_ax = PP();
-    
-    int pIDs[4] = {7, 11, 6, 10};
+    TString cachePath = TemplateCachePath(nx);
+    bool loaded = LoadTemplateFromDisk(cachePath, nx);
 
-    for(int i=0; i<4; i++) {
-        if(fTemplatesReady && fTemplates[i]) delete fTemplates[i];
-        fTemplates[i] = new TH2D(Form("fTemp_%d", pIDs[i]),
-                         Form("Sharing Template Pad %d (offset=%.3f);X [um];Y [um]", pIDs[i], fNumAmpOffset->GetNumber()),
-                         nx, min_ax, max_ax, ny, min_ax, max_ax);
-        fTemplates[i]->SetStats(0);
-    }
+    if (loaded) {
+        std::cout << ">>> Sharing Templates loaded from cache: " << cachePath << std::endl;
+    } else {
+        TDecompSparse *solver = GetSolver(false);
+        double step = PP() / nx;
 
-    
-    TCanvas *cT = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cT");
-    if (!cT) cT = new TCanvas("cT", "c4 - Sharing Templates (Central Pixel)", 600, 540);
-    cT->cd(); cT->Clear(); cT->Divide(2,2);
-    
-    std::cout << ">>> Computing Sharing Templates in the central pixel (500-1000 um)..." << std::endl;
+        double min_ax = 0;
+        double max_ax = PP();
 
-    // Loop at bin centres of the central pixel [PP, 2*PP]
-    for (double x = PP()+step/2.0; x <= PP()*2.0-step/2.0+1e-6; x += step) {
-        for (double y = PP()+step/2.0; y <= PP()*2.0-step/2.0+1e-6; y += step) {
-            
-            TVectorD B(nTot); B.Zero();
-            double padDirect[17] = {0};
-            InjectBilinear(B, x, y, padDirect);
+        int pIDs[4] = {7, 11, 6, 10};
 
-            bool ok;
-            TVectorD V = solver->Solve(B, ok);
-
-            std::vector<double> cur(17, 0.0);
-            double iTot = 0;
-            CollectCurrents(V, cur, iTot);
-            for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
-
-            // normalize to 1 over the 4 central pads
-            double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
-            for(int p=0; p<4; p++) cur[pIDs[p]] += ampOffset;
-            double iTot4 = 0;
-            for(int p=0; p<4; p++) {
-	      iTot4 += cur[pIDs[p]];
-            }
-
-            for(int p=0; p<4; p++) {
-	      fTemplates[p]->Fill(x - PP(), y - PP(), (iTot4 > 0) ? cur[pIDs[p]]/iTot4 : 0);
-            }
+        for(int i=0; i<4; i++) {
+            if(fTemplatesReady && fTemplates[i]) delete fTemplates[i];
+            fTemplates[i] = new TH2D(Form("fTemp_%d", pIDs[i]),
+                             Form("Sharing Template Pad %d (offset=%.3f);X [um];Y [um]", pIDs[i], fNumAmpOffset->GetNumber()),
+                             nx, min_ax, max_ax, ny, min_ax, max_ax);
+            fTemplates[i]->SetStats(0);
         }
-        gSystem->ProcessEvents(); // prevent GUI from freezing
-        std::cout << "Progress: " << (int)((x - PP()) / PP() * 100.0) << "%" << std::endl;
+
+        std::cout << ">>> Computing Sharing Templates in the central pixel (500-1000 um)..." << std::endl;
+
+        // Loop at bin centres of the central pixel [PP, 2*PP]
+        for (double x = PP()+step/2.0; x <= PP()*2.0-step/2.0+1e-6; x += step) {
+            for (double y = PP()+step/2.0; y <= PP()*2.0-step/2.0+1e-6; y += step) {
+
+                TVectorD B(nTot); B.Zero();
+                double padDirect[17] = {0};
+                InjectBilinear(B, x, y, padDirect);
+
+                bool ok;
+                TVectorD V = solver->Solve(B, ok);
+
+                std::vector<double> cur(17, 0.0);
+                double iTot = 0;
+                CollectCurrents(V, cur, iTot);
+                for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
+
+                // normalize to 1 over the 4 central pads
+                double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
+                for(int p=0; p<4; p++) cur[pIDs[p]] += ampOffset;
+                double iTot4 = 0;
+                for(int p=0; p<4; p++) {
+              iTot4 += cur[pIDs[p]];
+                }
+
+                for(int p=0; p<4; p++) {
+              fTemplates[p]->Fill(x - PP(), y - PP(), (iTot4 > 0) ? cur[pIDs[p]]/iTot4 : 0);
+                }
+            }
+            gSystem->ProcessEvents(); // prevent GUI from freezing
+            std::cout << "Progress: " << (int)((x - PP()) / PP() * 100.0) << "%" << std::endl;
+        }
+
+        SaveTemplateToDisk(cachePath, nx);
+        std::cout << ">>> Sharing Templates complete." << std::endl;
     }
-    
+
     fTemplatesReady = true;
     fBtnReco->SetEnabled(kTRUE);
     fBtnExport->SetEnabled(kTRUE);
 
+    TCanvas *cT = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cT");
+    if (!cT) cT = new TCanvas("cT", "c4 - Sharing Templates (Central Pixel)", 600, 540);
+    cT->cd(); cT->Clear(); cT->Divide(2,2);
     for(int i=0; i<4; i++) {
         cT->cd(i+1);
         fTemplates[i]->SetMinimum(0.0);
@@ -1457,7 +1522,6 @@ void DoSharingTemplates() {
         fTemplates[i]->Draw("COLZ");
     }
     cT->Update();
-    std::cout << ">>> Sharing Templates complete." << std::endl;
     SetStatus("  Ready  ", false);
 }
 
@@ -1716,18 +1780,23 @@ void DoSharingTemplates() {
         int pIDs[4] = {7, 11, 6, 10};
         double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
         for(int p=0; p<4; p++) cur[pIDs[p]] += ampOffset;
-        double iTot4 = 0;
-        for(int p=0; p<4; p++) iTot4 += cur[pIDs[p]];
         double L = fChkLandau->IsOn() ? rand.Landau(1.0, 0.3) : 1.0;
         double amp = Amplitude();
         double A_noisy[4];
         double sum_noisy = 0;
         for(int p=0; p<4; p++) {
-            double sig = (iTot4 > 0) ? cur[pIDs[p]]/iTot4 : 0;
-            A_noisy[p] = amp * sig + rand.Gaus(0, noise) / L;
+            // Raw fraction of the TOTAL injected charge (not renormalized to
+            // the 4 central pads): a lower central-4 fraction (charge lost to
+            // neighboring pads) correctly yields a smaller absolute signal
+            // here, against the same fixed-RMS noise, degrading SNR as it
+            // physically should.
+            A_noisy[p] = amp * cur[pIDs[p]] + rand.Gaus(0, noise) / L;
             sum_noisy += A_noisy[p];
         }
 
+        // Renormalize AFTER noise, only so the shape can be chi2-matched
+        // against the templates (which are themselves normalized to sum 1
+        // over the 4 pads -- see DoSharingTemplates).
         for(int p=0; p<4; p++) A_noisy[p] /= sum_noisy;
 
         // template matching: find minimum chi2
