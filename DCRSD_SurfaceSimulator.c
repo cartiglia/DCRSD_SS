@@ -43,6 +43,7 @@ private:
     TGNumberEntry       *fNumNoise, *fNumAmpOffset, *fNumConstTerm, *fNumScanStep, *fNumThreshold, *fNumRecoEvents;
     TGNumberEntry       *fNumRin;
     TGNumberEntry       *fNumPadRadius;
+    TGNumberEntry       *fNumRise = nullptr, *fNumFlat = nullptr, *fNumFall = nullptr;  // input pulse [ps]
     TGTextEntry         *fCfgFile;
     TGCheckButton       *fChkTrench    = nullptr;
     TGCheckButton       *fChkNoStruct = nullptr;
@@ -152,7 +153,7 @@ private:
     TMatrixDSparse *fMatrixTrans = nullptr; 
     double fLastRsheetTrans = -1, fLastRStripPTrans = -1, fLastRStripMTrans = -1, fLastThickTrans = -1, fLastGapTrans = -1, fLastPPTrans = -1, fLastRinTrans = -1;
     bool   fLastTrenchTrans = false;
-    double fLastDtTrans = -1, fLastCnodeTrans = -1;
+    double fLastDtTrans = -1, fLastCnodeTrans = -1, fLastPadRTrans = -1, fLastGapPadTrans = -1;
 
     std::vector<int> fTypeMap;
     std::vector<int> fPadOwnerMap;
@@ -277,9 +278,20 @@ public:
         fNumRin = new TGNumberEntry(vCol2, 50, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAAnyNumber, TGNumberFormat::kNELLimitMinMax, 0, 1000000);
         vCol2->AddFrame(fNumRin, entL);
 
-        vCol2->AddFrame(new TGLabel(vCol2, "Pulse Duration [ns]:"), lblL);
-        fNumDur = new TGNumberEntry(vCol2, 2.0, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 0.1, 100.0);
+        vCol2->AddFrame(new TGLabel(vCol2, "Transient time window [ns]:"), lblL);
+        fNumDur = new TGNumberEntry(vCol2, 5.0, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 0.1, 100.0);
         vCol2->AddFrame(fNumDur, entL);
+
+        // Trapezoidal input current: rise / flat top / fall [ps]
+        vCol2->AddFrame(new TGLabel(vCol2, "Pulse rise / flat / fall [ps]:"), lblL);
+        TGHorizontalFrame *hPulse = new TGHorizontalFrame(vCol2);
+        fNumRise = new TGNumberEntry(hPulse, 400, 5, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 10000);
+        fNumFlat = new TGNumberEntry(hPulse, 100, 5, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 10000);
+        fNumFall = new TGNumberEntry(hPulse, 500, 5, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 10000);
+        hPulse->AddFrame(fNumRise, new TGLayoutHints(kLHintsLeft, 0, 2, 0, 0));
+        hPulse->AddFrame(fNumFlat, new TGLayoutHints(kLHintsLeft, 0, 2, 0, 0));
+        hPulse->AddFrame(fNumFall, new TGLayoutHints(kLHintsLeft, 0, 0, 0, 0));
+        vCol2->AddFrame(hPulse, entL);
 
         BoldHead(vCol2, "--- Threshold scan ---");
         vCol2->AddFrame(new TGLabel(vCol2, "Threshold for scans [%]:"), lblL);
@@ -322,6 +334,11 @@ public:
         btnTrans->Connect("Clicked()", "RSDStripPanel", this, "DoTransient()");
         vCol3->AddFrame(btnTrans, btnL); btnTrans->Resize(250, 40);
         btnTrans->SetBackgroundColor(0xffe4b0);
+
+        TGTextButton *btnTransShare = new TGTextButton(vCol3, "Transient vs static sharing (x scan)");
+        btnTransShare->Connect("Clicked()", "RSDStripPanel", this, "DoTransientSharing()");
+        vCol3->AddFrame(btnTransShare, btnL); btnTransShare->Resize(250, 30);
+        btnTransShare->SetBackgroundColor(0xffe4b0);
 
         BoldHead(vCol3, "--- 2D Scans ---");
         TGTextButton *btnScanC = new TGTextButton(vCol3, "Fraction of charge in the 4 central pads");
@@ -687,98 +704,6 @@ public:
         return R_bulk;
     }
 
-    void CalculatePropagation(double injX, double injY, std::vector<double>& out_delays, std::vector<TGraph*>& out_paths) {
-        double thick_um = fNumThick->GetNumber();
-        
-        int targets[4] = {6, 7, 10, 11};
-        int targetCenters[4] = {100*n + 100, 100*n + 200, 200*n + 100, 200*n + 200};
-
-        for (int idx = 0; idx < 4; idx++) {
-            int targetID = targets[idx];
-            int targetCenter = targetCenters[idx];
-
-            int injI = TMath::Nint(injX/Pitch());
-            int injJ = TMath::Nint(injY/Pitch());
-            if(injI < 0) injI = 0; if(injI >= n) injI = n - 1;
-            if(injJ < 0) injJ = 0; if(injJ >= n) injJ = n - 1;
-            int startNode = injI * n + injJ;
-
-            std::vector<double> dist(nTot, 1e15); 
-            std::vector<int> parent(nTot, -1);
-            dist[startNode] = 0.0;
-
-            using pdi = std::pair<double, int>;
-            std::priority_queue<pdi, std::vector<pdi>, std::greater<pdi>> pq;
-            pq.push({0.0, startNode});
-
-            int di[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-            int dj[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-            double ds_mm[8] = { 0.005, 0.005, 0.005, 0.005, 0.005*1.414213, 0.005*1.414213, 0.005*1.414213, 0.005*1.414213 };
-
-            while(!pq.empty()) {
-                double d = pq.top().first;
-                int u = pq.top().second;
-                pq.pop();
-
-                if (d > dist[u]) continue;
-                if (u == targetCenter) break; 
-
-                int ui = u / n;
-                int uj = u % n;
-                double r_u = GetLocalResistance(ui * Pitch(), uj * Pitch());
-
-                for (int k = 0; k < 8; k++) {
-                    int vi = ui + di[k];
-                    int vj = uj + dj[k];
-                    if (vi >= 0 && vi < n && vj >= 0 && vj < n) {
-                        int v = vi * n + vj;
-                        
-                        int pad_at_v = fTypeMap[v];
-                        int strip_owner = fPadOwnerMap[v];
-                        
-                        bool is_foreign_pad = (pad_at_v > 0 && pad_at_v != targetID);
-                        bool is_foreign_strip = (strip_owner > 0 && strip_owner != targetID);
-                        
-                        if ((is_foreign_pad || is_foreign_strip) && v != startNode) {
-                            continue; 
-                        }
-                        
-                        double r_v = GetLocalResistance(vi * Pitch(), vj * Pitch());
-                        double r_avg = (r_u + r_v) / 2.0; 
-                        
-                        double local_v_factor = 0.56 * std::sqrt((r_avg / PP()*1.5) * (50.0 / thick_um));
-                        double cost = ds_mm[k] * local_v_factor;
-                        
-                        if (dist[u] + cost < dist[v]) {
-                            dist[v] = dist[u] + cost;
-                            parent[v] = u;
-                            pq.push({dist[v], v});
-                        }
-                    }
-                }
-            }
-
-            out_delays.push_back(dist[targetCenter]);
-            
-            TGraph* gr = new TGraph();
-            int curr = targetCenter;
-            int pt = 0;
-            while(curr != -1 && curr != startNode) {
-                double cx = (curr / n) * Pitch();
-                double cy = (curr % n) * Pitch();
-                gr->SetPoint(pt++, cx, cy);
-                curr = parent[curr];
-            }
-            if (curr == startNode) {
-                double cx = (startNode / n) * Pitch();
-                double cy = (startNode % n) * Pitch();
-                gr->SetPoint(pt++, cx, cy);
-            }
-            gr->SetLineWidth(3);
-            out_paths.push_back(gr);
-        }
-    }
-
     // Collects pad currents from solution vector V.
     // R_in=0: V[pad]=0, current from edge flows; R_in>0: I[pad]=V[pad]/R_in
     void CollectCurrents(const TVectorD &V, std::vector<double> &cur, double &iTot) {
@@ -866,12 +791,15 @@ public:
         } else {
             bool trench = TrenchEnabled();
             double gap = fNumStripGap->GetNumber(); double pp = PP();
-        double rin = fNumRin->GetNumber();
-            if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans) return fSolverTrans;
+            double gap_pad = fNumStripGapPad->GetNumber(); double pad_r = PadRadius();
+            double rin = fNumRin->GetNumber();
+            // keep the electrode type map in sync with the current geometry
+            if (pp != fLastPPStat || pad_r != fLastPadRadiusStat) GetSolver(false);
+            if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans && pad_r==fLastPadRTrans && gap_pad==fLastGapPadTrans) return fSolverTrans;
             if (fSolverTrans) delete fSolverTrans; if (fMatrixTrans) delete fMatrixTrans;
             fMatrixTrans = new TMatrixDSparse(nTot, nTot); BuildMatrix(*fMatrixTrans, true, C_node/dt);
             fSolverTrans = new TDecompSparse(); fSolverTrans->SetMatrix(*fMatrixTrans); fSolverTrans->Decompose();
-            fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin;
+            fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin; fLastPadRTrans = pad_r; fLastGapPadTrans = gap_pad;
             return fSolverTrans;
         }
     }
@@ -1046,105 +974,186 @@ void DoInjectCharge() {
 
 
 
+    // ------------------------------------------------------------------
+    // Transient model
+    // ------------------------------------------------------------------
+    // Input current: trapezoid (rise / flat top / fall, GUI [ps]), unit height.
+    double PulseShape(double t) {
+        double tr = fNumRise->GetNumber()*1e-12, tf = fNumFlat->GetNumber()*1e-12, td = fNumFall->GetNumber()*1e-12;
+        if (t < 0) return 0;
+        if (t < tr) return (tr > 0) ? t/tr : 1.0;
+        if (t < tr + tf) return 1.0;
+        if (t < tr + tf + td) return (td > 0) ? 1.0 - (t - tr - tf)/td : 0.0;
+        return 0;
+    }
+
+    // Time-domain solution of the RC network for a hit at (x,y) [um].
+    // Each node has capacitance C_node = eps0*epsSi*h^2/d to the back plane; the
+    // node equations C dV/dt = -G V + B(t) are integrated with backward Euler,
+    // (G + C/dt) V^{n+1} = (C/dt) V^n + B^{n+1}. The pad currents are collected
+    // exactly as in the static case (CollectCurrents: V/R_in for R_in>0, edge
+    // currents into the grounded pad for R_in=0).
+    // Outputs, per pad (index 1..16): peak current, time of the peak, integral.
+    // If gr != nullptr, the current of the 4 central pads (and the input) is stored.
+    void TransientHit(double x, double y, double window, double dt,
+                      std::vector<double> &peak, std::vector<double> &tpeak, std::vector<double> &area,
+                      TGraph **gr = nullptr, TGraph *gIn = nullptr) {
+        double thick = fNumThick->GetNumber()*1e-6;
+        double C_node = eps0*epsSi*(Pitch()*1e-6)*(Pitch()*1e-6)/thick;
+        TDecompSparse *solver = GetSolver(true, dt, C_node);
+        TVectorD Binj(nTot); Binj.Zero();
+        double padDirect[17] = {0};
+        InjectBilinear(Binj, x, y, padDirect);
+        peak.assign(17, 0.0); tpeak.assign(17, 0.0); area.assign(17, 0.0);
+        TVectorD V(nTot); V.Zero(); TVectorD B(nTot);
+        std::vector<double> cur(17, 0.0); double iTot = 0;
+        int nSteps = (int)(window/dt);
+        for (int s = 1; s <= nSteps; s++) {
+            double t = s*dt, I = PulseShape(t);
+            for (int i = 0; i < nTot; i++) B(i) = (C_node/dt)*V(i) + I*Binj(i);
+            bool ok; V = solver->Solve(B, ok);
+            CollectCurrents(V, cur, iTot);
+            for (int k = 1; k <= 16; k++) {
+                double c = cur[k] + I*padDirect[k];
+                area[k] += c*dt;
+                if (c > peak[k]) { peak[k] = c; tpeak[k] = t; }
+                if (gr && (k==6 || k==7 || k==10 || k==11)) {
+                    int q = (k==6) ? 0 : (k==7) ? 1 : (k==10) ? 2 : 3;
+                    gr[q]->SetPoint(gr[q]->GetN(), t*1e9, c);
+                }
+            }
+            if (gIn) gIn->SetPoint(gIn->GetN(), t*1e9, I);
+            if (s % 200 == 0) gSystem->ProcessEvents();
+        }
+    }
+
+    // Static (DC) sharing for a hit at (x,y) [um]; per pad 1..16, normalised to the total.
+    void StaticHit(double x, double y, std::vector<double> &frac) {
+        TDecompSparse *solver = GetSolver(false);
+        TVectorD B(nTot); B.Zero();
+        double padDirect[17] = {0};
+        InjectBilinear(B, x, y, padDirect);
+        bool ok; TVectorD V = solver->Solve(B, ok);
+        std::vector<double> cur(17, 0.0); double iTot = 0;
+        CollectCurrents(V, cur, iTot);
+        frac.assign(17, 0.0); double tot = 0;
+        for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; tot += cur[k]; }
+        for (int k = 1; k <= 16; k++) frac[k] = cur[k]/tot;
+    }
+
     void DoTransient() {
         SetStatus("  Computing...  ", true);
-        double thick_um = fNumThick->GetNumber();
-        double thick = thick_um * 1e-6;
-        double duration = fNumDur->GetNumber() * 1e-9; 
-        double C_node = eps0 * epsSi * (Pitch()*1e-6) * (Pitch()*1e-6) / thick;
-        double dt = 20e-12; int nSteps = (int)(duration / dt);
-        
-        TDecompSparse *solver = GetSolver(true, dt, C_node);
-        TVectorD V(nTot); V.Zero(); TVectorD B(nTot); 
-        double injX = fNumX->GetNumber(); double injY = fNumY->GetNumber();
-        int injI = std::max(0, std::min(n-1, TMath::Nint(injX/Pitch())));
-        int injJ = std::max(0, std::min(n-1, TMath::Nint(injY/Pitch())));
-        int injIdx = injI*n + injJ;
+        double window = fNumDur->GetNumber()*1e-9, dt = 5e-12;
+        double injX = fNumX->GetNumber(), injY = fNumY->GetNumber();
+        TGraph *gr[4]; int col[4] = {kRed, kBlue, kGreen+2, kMagenta};
+        for (int q = 0; q < 4; q++) { gr[q] = new TGraph(); gr[q]->SetLineColor(col[q]); gr[q]->SetLineWidth(2); }
+        TGraph *gIn = new TGraph(); gIn->SetLineColor(kBlack); gIn->SetLineStyle(2); gIn->SetLineWidth(2);
+        std::vector<double> peak, tpeak, area;
+        TransientHit(injX, injY, window, dt, peak, tpeak, area, gr, gIn);
 
-        TGraph *gP6  = new TGraph(); 
-        TGraph *gP7  = new TGraph(); 
-        TGraph *gP10 = new TGraph(); 
-        TGraph *gP11 = new TGraph();
-        TGraph *gInput = new TGraph(); 
-
-        gP6->SetLineColor(kRed); gP6->SetLineWidth(2);
-        gP7->SetLineColor(kBlue); gP7->SetLineWidth(2);
-        gP10->SetLineColor(kGreen+2); gP10->SetLineWidth(2);
-        gP11->SetLineColor(kMagenta); gP11->SetLineWidth(2);
-        gInput->SetLineColor(kBlack); gInput->SetLineStyle(2); gInput->SetLineWidth(2);
-
-        std::vector<double> delays;
-        std::vector<TGraph*> paths; 
-        CalculatePropagation(injX, injY, delays, paths);
-        for(auto p : paths) delete p; 
-        
-        double delay6  = delays[0];
-        double delay7  = delays[1];
-        double delay10 = delays[2];
-        double delay11 = delays[3];
-
-        double maxSig = 0;
-
-        for (int t=0; t<nSteps; t++) {
-            for(int i=0; i<nTot; i++) B(i) = (C_node/dt) * V(i);
-            double inputVal = 0; if (t > 5 && t <= 10) { inputVal = 10.0; B(injIdx) += inputVal; }
-            bool ok; V = solver->Solve(B, ok); 
-
-            double i6=0, i7=0, i10=0, i11=0;
-            const int di[]={1,-1,0,0}, dj[]={0,0,1,-1};
-            for (int i=0; i<n; i++) { for (int j=0; j<n; j++) {
-                int idx = i*n+j;
-                if (fTypeMap[idx] == 0) {
-                    for(int k=0; k<4; k++){
-                        int ni=i+di[k], nj=j+dj[k];
-                        if(ni>=0 && ni<n && nj>=0 && nj<n && fTypeMap[ni*n+nj]>0) {
-                            double cond = GetEdgeConductance(i, j, di[k], dj[k]);
-                            double cur  = V(idx) * cond;
-                            int id = fTypeMap[ni*n+nj];
-                            if (id==6) i6+=cur; else if (id==7) i7+=cur; else if (id==10) i10+=cur; else if (id==11) i11+=cur;
-                        }
-                    }
-                }
-            }}
-            
-            double time_ns = t * dt * 1e9;
-            
-            if (delay6 < 1e14) gP6->SetPoint(t, time_ns + delay6, i6); else gP6->SetPoint(t, time_ns, i6);
-            if (delay7 < 1e14) gP7->SetPoint(t, time_ns + delay7, i7); else gP7->SetPoint(t, time_ns, i7);
-            if (delay10 < 1e14) gP10->SetPoint(t, time_ns + delay10, i10); else gP10->SetPoint(t, time_ns, i10);
-            if (delay11 < 1e14) gP11->SetPoint(t, time_ns + delay11, i11); else gP11->SetPoint(t, time_ns, i11);
-            
-            maxSig = std::max({maxSig, i6, i7, i10, i11});
-            gInput->SetPoint(t, time_ns, inputVal);
-            if (t % 100 == 0) gSystem->ProcessEvents(); 
-        }
-
-        double maxIn = TMath::MaxElement(gInput->GetN(), gInput->GetY());
-        if (maxIn > 0 && maxSig > 0) { double scaleFactor = maxSig / maxIn; for (int k=0; k<gInput->GetN(); k++) gInput->GetY()[k] *= scaleFactor; }
-        
+        double maxSig = std::max({peak[6], peak[7], peak[10], peak[11]});
+        for (int k = 0; k < gIn->GetN(); k++) gIn->GetY()[k] *= maxSig;  // input drawn on the same scale
         TCanvas *cScope = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cScope");
         if (!cScope) cScope = new TCanvas("cScope", "c1 - RSD Oscilloscope", 480, 360);
         cScope->cd(); cScope->Clear(); gPad->SetGrid();
-        
-        double valid_delay6 = (delay6 < 1e14) ? delay6 : 0;
-        double valid_delay7 = (delay7 < 1e14) ? delay7 : 0;
-        double valid_delay10 = (delay10 < 1e14) ? delay10 : 0;
-        double valid_delay11 = (delay11 < 1e14) ? delay11 : 0;
-
-        double max_t = (nSteps * dt * 1e9) + std::max({valid_delay6, valid_delay7, valid_delay10, valid_delay11});
-        TH1F *hFrame = cScope->DrawFrame(0, 0, max_t, (maxSig>0)?maxSig*1.1:1.0);
-        hFrame->SetTitle("Transient with Fermat Diffraction Delay;Time [ns];Current [a.u.]");
-
-        gP6->Draw("L SAME"); gP7->Draw("L SAME"); gP10->Draw("L SAME"); gP11->Draw("L SAME"); gInput->Draw("L SAME");
-        
-        TLegend *leg = new TLegend(0.75, 0.6, 0.95, 0.9);
-        leg->AddEntry(gInput, "Input Pulse (T0)", "l"); 
-        leg->AddEntry(gP6, "Pad 6", "l"); 
-        leg->AddEntry(gP7, "Pad 7", "l");
-        leg->AddEntry(gP10, "Pad 10", "l"); 
-        leg->AddEntry(gP11, "Pad 11", "l");
+        TH1F *hFrame = cScope->DrawFrame(0, 0, window*1e9, (maxSig > 0) ? maxSig*1.1 : 1.0);
+        hFrame->SetTitle("Transient RC response;Time [ns];Current [a.u.]");
+        for (int q = 0; q < 4; q++) gr[q]->Draw("L SAME");
+        gIn->Draw("L SAME");
+        TLegend *leg = new TLegend(0.70, 0.6, 0.95, 0.9);
+        leg->AddEntry(gIn, "Input pulse (scaled)", "l");
+        const char *nm[4] = {"Pad 6", "Pad 7", "Pad 10", "Pad 11"};
+        for (int q = 0; q < 4; q++) leg->AddEntry(gr[q], nm[q], "l");
         leg->Draw(); cScope->Update(); cScope->RaiseWindow();
+
+        double tpkIn = (fNumRise->GetNumber() + 0.5*fNumFlat->GetNumber())*1e-12;
+        printf(">>> Transient at (%.0f, %.0f) um: pad  peak-frac  area-frac  peak delay [ps]\n", injX, injY);
+        double sp = 0, sa = 0; for (int k = 1; k <= 16; k++) { sp += peak[k]; sa += area[k]; }
+        int pid[4] = {6, 7, 10, 11};
+        for (int q = 0; q < 4; q++)
+            printf("    P%-2d  %.4f  %.4f  %6.0f\n", pid[q], peak[pid[q]]/sp, area[pid[q]]/sa, (tpeak[pid[q]] - tpkIn)*1e12);
         SetStatus("  Ready  ", false);
+    }
+
+    // Compares the static sharing with the transient one (signal area and peak
+    // amplitude) along x at mid-height of the central pixel. The reconstruction
+    // variable is f_left = (P6+P7)/(P6+P7+P10+P11); sigma_x scales as
+    // 1/|d f_left/dx|. Prints the mean gradient ratio transient/static and the
+    // maximum peak delay among the 4 central pads.
+    void DoTransientSharing() {
+        SetStatus("  Computing...  ", true);
+        double window = fNumDur->GetNumber()*1e-9, dt = 5e-12;
+        double p = PP();
+        const int nx = 10;
+        double xs[nx], fS[nx], fA[nx], fP[nx];
+        double tpkIn = (fNumRise->GetNumber() + 0.5*fNumFlat->GetNumber())*1e-12;
+        double maxDelay = 0;
+        auto fleft = [](const std::vector<double> &v) { return (v[6]+v[7])/(v[6]+v[7]+v[10]+v[11]); };
+        for (int i = 0; i < nx; i++) {
+            double u = 0.05 + 0.1*i;
+            double x = p*(1 + u), y = 1.5*p;
+            std::vector<double> fs, peak, tpeak, area;
+            StaticHit(x, y, fs);
+            TransientHit(x, y, window, dt, peak, tpeak, area);
+            xs[i] = u; fS[i] = fleft(fs); fA[i] = fleft(area); fP[i] = fleft(peak);
+            for (int k : {6, 7, 10, 11}) maxDelay = std::max(maxDelay, tpeak[k] - tpkIn);
+        }
+        // the hit next to an electrode gives the longest delays to the far pads
+        {
+            std::vector<double> peak, tpeak, area;
+            TransientHit(1.1*p, 1.1*p, window, dt, peak, tpeak, area);
+            for (int k : {6, 7, 10, 11}) maxDelay = std::max(maxDelay, tpeak[k] - tpkIn);
+        }
+        auto meanGrad = [&](const double *f) {
+            double s = 0;
+            for (int i = 0; i < nx; i++) {
+                int a = std::max(0, i-1), b = std::min(nx-1, i+1);
+                s += std::abs((f[b]-f[a])/((xs[b]-xs[a])*p*1e-3));
+            }
+            return s/nx;
+        };
+        double gS = meanGrad(fS), gA = meanGrad(fA), gP = meanGrad(fP);
+        double maxDevA = 0;
+        for (int i = 0; i < nx; i++) maxDevA = std::max(maxDevA, std::abs(fA[i]-fS[i]));
+
+        const char *cfg = TrenchEnabled() ? "trench" : (fNumStripGap->GetNumber() >= PP() ? "no structure" : "resistive strip");
+        printf("\n>>> Transient vs static sharing: pitch %.0f um, %s, Rsheet %.0f Ohm/sq, d %.0f um, Rin %.0f Ohm, pulse %.0f/%.0f/%.0f ps\n",
+               p, cfg, fNumRsheet->GetNumber(), fNumThick->GetNumber(), fNumRin->GetNumber(),
+               fNumRise->GetNumber(), fNumFlat->GetNumber(), fNumFall->GetNumber());
+        printf("    x/p        "); for (int i = 0; i < nx; i++) printf(" %6.2f", xs[i]); printf("\n");
+        printf("    f_left DC  "); for (int i = 0; i < nx; i++) printf(" %6.3f", fS[i]); printf("\n");
+        printf("    f_left area"); for (int i = 0; i < nx; i++) printf(" %6.3f", fA[i]); printf("\n");
+        printf("    f_left peak"); for (int i = 0; i < nx; i++) printf(" %6.3f", fP[i]); printf("\n");
+        printf("    max |f_area - f_DC| = %.4f\n", maxDevA);
+        printf("    mean |grad| [1/mm]: DC %.3f  area %.3f  peak %.3f\n", gS, gA, gP);
+        printf("    RESULT pitch=%.0f cfg=%s grad_ratio_peak/DC=%.3f grad_ratio_area/DC=%.3f max_delay_ps=%.0f\n",
+               p, cfg, gP/gS, gA/gS, maxDelay*1e12);
+
+        TCanvas *c = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cTransShare");
+        if (!c) c = new TCanvas("cTransShare", "Transient vs static sharing", 520, 400);
+        c->cd(); c->Clear(); gPad->SetGrid();
+        TGraph *g1 = new TGraph(nx, xs, fS), *g2 = new TGraph(nx, xs, fA), *g3 = new TGraph(nx, xs, fP);
+        g1->SetTitle(TString::Format("%s, pitch %.0f #mum;x / pitch;(P6+P7) / #Sigma_{4}", cfg, p));
+        g1->SetMarkerStyle(20); g2->SetMarkerStyle(24); g2->SetMarkerColor(kBlue); g2->SetLineColor(kBlue);
+        g3->SetMarkerStyle(21); g3->SetMarkerColor(kRed); g3->SetLineColor(kRed);
+        g1->SetMinimum(0); g1->SetMaximum(1);
+        g1->Draw("APL"); g2->Draw("PL SAME"); g3->Draw("PL SAME");
+        TLegend *leg = new TLegend(0.55, 0.70, 0.9, 0.88);
+        leg->AddEntry(g1, "static", "lp"); leg->AddEntry(g2, "transient, area", "lp"); leg->AddEntry(g3, "transient, peak", "lp");
+        leg->Draw(); c->Update();
+        SetStatus("  Ready  ", false);
+    }
+
+    // Batch helper (see RunTransientCheck.C): set pitch, structure, Rsheet, thickness, R_in.
+    // structure: 0 = no structure, 1 = trench.
+    void ConfigureForCheck(double pitch, int structure, double rsheet, double thick, double rin) {
+        fNumPixelPitch->SetNumber(pitch);
+        fNumRsheet->SetNumber(rsheet);
+        fNumThick->SetNumber(thick);
+        fNumRin->SetNumber(rin);
+        fChkNoStruct->SetState(kButtonUp); DoNoStructToggle();
+        fChkTrench->SetState(structure == 1 ? kButtonDown : kButtonUp); DoTrenchToggle();
+        if (structure == 0) { fChkNoStruct->SetState(kButtonDown); DoNoStructToggle(); }
     }
 
     void DoMapScanCentral() { RunScan(0); }
@@ -1632,6 +1641,9 @@ void DoSharingTemplates() {
     f << "Threshold="   << fNumThreshold->GetNumber()   << "\n";
     f << "Thick="       << fNumThick->GetNumber()       << "\n";
     f << "Dur="         << fNumDur->GetNumber()         << "\n";
+    f << "Rise="        << fNumRise->GetNumber()        << "\n";
+    f << "Flat="        << fNumFlat->GetNumber()        << "\n";
+    f << "Fall="        << fNumFall->GetNumber()        << "\n";
     f << "RecoEvents="  << fNumRecoEvents->GetNumber()  << "\n";
     f << "Landau="      << (fChkLandau->IsOn() ? 1 : 0) << "\n";
     f.close();
@@ -1664,6 +1676,9 @@ void DoSharingTemplates() {
         else if (name == "Threshold")   fNumThreshold->SetNumber(val);
         else if (name == "Thick")       fNumThick->SetNumber(val);
         else if (name == "Dur")         fNumDur->SetNumber(val);
+        else if (name == "Rise")        fNumRise->SetNumber(val);
+        else if (name == "Flat")        fNumFlat->SetNumber(val);
+        else if (name == "Fall")        fNumFall->SetNumber(val);
         else if (name == "RecoEvents")  fNumRecoEvents->SetNumber((int)val);
         else if (name == "Landau")      fChkLandau->SetState(val ? kButtonDown : kButtonUp);
     }
