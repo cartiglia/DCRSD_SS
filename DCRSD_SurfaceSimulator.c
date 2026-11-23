@@ -32,6 +32,16 @@ const double eps0 = 8.854e-12; // F/m
 const double epsSi = 11.7;
 // pitch_m removed: use Pitch()*1e-6 instead
 
+// The pad short (G_short = 1e6 S) makes the KCL matrix ill-conditioned. With the
+// default pivoting threshold, TDecompSparse::Solve refactorises the matrix when the
+// residual of a solve is above its tolerance, and that refactorisation crashes
+// (segfault) for some injection points. All solvers therefore use the maximum
+// pivoting threshold, which disables the refactorisation.
+class RSDSparseSolver : public TDecompSparse {
+public:
+    void MaxPivoting() { SetThresholdPivoting(kThresholdPivotingMax); }
+};
+
 class RSDStripPanel : public TGMainFrame {
 private:
     TRootEmbeddedCanvas *fEcanvas; 
@@ -53,13 +63,15 @@ private:
     TGTextButton        *fBtnReco   = nullptr;
     TGTextButton        *fBtnExport = nullptr;
 
-    const int n = 301;
+    double fRside = 0, fRdiag = 0;  // last inter-electrode resistances [Ohm]
+    int fNDiv = 100;                // grid nodes per pixel pitch (h = PP/fNDiv)
+    int n = 3*100 + 1;              // nodes per side = 3*fNDiv + 1
     double PP()        { return fNumPixelPitch->GetNumber(); }   // pixel Pitch() [um]
-    double Pitch()     { return PP() / 100.0; }                  // grid Pitch() [um/node]
+    double Pitch()     { return PP() / fNDiv; }                  // grid Pitch() [um/node]
     double Dim()       { return 3.0 * PP(); }                    // total detector size [um]
     double PadRadius()  { return fNumPadRadius->GetNumber(); }   // pad radius [um]
     double Amplitude()  { return fNumAmplitude->GetNumber(); }   // signal amplitude [a.u.]
-    const int nTot = n * n;
+    int nTot = n * n;
 
     // Bilinear charge injection at continuous (x,y) [um] onto the 4 surrounding
     // grid nodes. Replaces nearest-node rounding (TMath::Nint), which produced a
@@ -80,6 +92,7 @@ private:
         bool rin0 = (fNumRin->GetNumber() <= 0.0);
         for (int k = 0; k < 4; k++) {
             int idx = ii[k]*n + jj[k];
+            if (fTrenchNoGain && IsTrenchNode(ii[k], jj[k])) continue;   // no gain under the trench
             if (rin0 && padDirect && fTypeMap[idx] > 0)
                 padDirect[fTypeMap[idx]] += w[k];
             else
@@ -105,8 +118,8 @@ private:
             geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
                 PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
                 fNumStripGap->GetNumber(), fNumStripGapPad->GetNumber(), rin, rpad);
-        return TString::Format("template_cache/template_%s_nx%d_off%.3f.txt",
-                                geomKey.Data(), nx, fNumAmpOffset->GetNumber());
+        return TString::Format("template_cache/template_%s%s_nx%d_off%.3f.txt",
+                                geomKey.Data(), GridTag().Data(), nx, fNumAmpOffset->GetNumber());
     }
 
     bool LoadTemplateFromDisk(const TString &path, int nx) {
@@ -456,7 +469,7 @@ public:
     void BuildTypeMaps(double pp, double pad_r = 60.0) {
         std::fill(fTypeMap.begin(), fTypeMap.end(), 0);
         std::fill(fPadOwnerMap.begin(), fPadOwnerMap.end(), 0);
-        double p = pp / 100.0; // grid pitch
+        double p = pp / fNDiv; // grid pitch
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 double x = i * p, y = j * p;
@@ -479,6 +492,50 @@ public:
     }
 
     bool TrenchEnabled() { return fChkTrench && fChkTrench->IsOn(); }
+
+    // Trench geometry. Width [um]: fTrenchW if set, otherwise one node pitch of the
+    // default grid (PP/100), i.e. a few um as in the FBK sensors. The band covers
+    // the 2m+1 node rows around k*fNDiv with (2m+1)*h ~ width.
+    double fTrenchW = -1;
+    bool   fTrenchNoGain = true;   // no gain layer under the trench (no injected charge)
+    double TrenchWidth() { return (fTrenchW > 0) ? fTrenchW : PP()/100.0; }
+    int TrenchHalfRows() { return std::max(0, (int)std::lround((TrenchWidth()/Pitch() - 1.0)/2.0)); }
+    bool TrenchLine(int k_node) {
+        int m = TrenchHalfRows();
+        for (int k = 1; k <= 2; k++) if (std::abs(k_node - k*fNDiv) <= m) return true;
+        return false;
+    }
+    // Node inside the trench band (and not at an electrode, where the trench stops).
+    bool IsTrenchNode(int i, int j) {
+        if (!TrenchEnabled()) return false;
+        double pad_r = PadRadius();
+        auto nearPad = [&](double along) {
+            for (int c = 0; c < 4; c++) if (std::abs(along - c*PP()) <= pad_r) return true;
+            return false;
+        };
+        return (TrenchLine(j) && !nearPad(i*Pitch())) || (TrenchLine(i) && !nearPad(j*Pitch()));
+    }
+
+    // Cache-key suffix for a non-default grid (empty for fNDiv = 100) and for a
+    // non-default trench width.
+    TString GridTag() {
+        TString t = (fNDiv == 100) ? TString("") : TString::Format("_nd%d", fNDiv);
+        if (TrenchEnabled() && fTrenchW > 0) t += TString::Format("_tw%.1f", fTrenchW);
+        return t;
+    }
+
+    // Batch helper (grid-convergence study): change the number of grid nodes per pitch.
+    void SetGridDivisions(int ndiv) {
+        if (ndiv == fNDiv) return;
+        fNDiv = ndiv; n = 3*ndiv + 1; nTot = n*n;
+        fTypeMap.assign(nTot, 0); fPadOwnerMap.assign(nTot, 0);
+        if (fSolverStatic) { delete fSolverStatic; fSolverStatic = nullptr; }
+        if (fMatrixStatic) { delete fMatrixStatic; fMatrixStatic = nullptr; }
+        if (fSolverTrans)  { delete fSolverTrans;  fSolverTrans  = nullptr; }
+        if (fMatrixTrans)  { delete fMatrixTrans;  fMatrixTrans  = nullptr; }
+        fLastPPStat = -1; fLastPPTrans = -1;
+        fTemplatesReady = false;
+    }
 
     // Center node of pad k (1..16): the single representative that drains to GND via R_in
     int PadCenterNode(int pad_k) {
@@ -568,40 +625,18 @@ public:
         // Cuts cross-trench bulk edges, but leaves gaps at the electrode pads.
         if (TrenchEnabled()) {
             const double pad_r = PadRadius();
-            // The trench line sits exactly on node row/column k*100. Cut the edges
-            // touching that row from BOTH sides (99<->100 and 100<->101): cutting only
-            // the crossing edge attached the trench row to one pixel and shifted the
-            // whole response by one node pitch along the diagonal.
-            if (di == 0) {
-                // Vertical edge: check if it touches y = 500 or y = 1000
-                for (int k = 1; k <= 2; k++) {
-                    if ((j == k*100) != (j + dj == k*100)) {
-                        double xmid = i * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(xmid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
-                }
-            } else {
-                // Horizontal or diagonal edge: check both x and y boundary lines
-                for (int k = 1; k <= 2; k++) {
-                    if ((i == k*100) != (i + di == k*100)) {
-                        double ymid = j * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(ymid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
-                    if (dj != 0 && (j == k*100) != (j + dj == k*100)) {
-                        double xmid = i * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(xmid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
-                }
-            }
+            // The trench is a band of width TrenchWidth() centred on the node
+            // row/column k*fNDiv (TrenchLine). Edges crossing the band boundary are
+            // cut (zero conductance), except within pad_r of an electrode along the
+            // line (the trench stops at the pads). With the default width (one
+            // node pitch of the default grid) the band is the single row k*fNDiv,
+            // cut on both sides, which keeps the geometry symmetric.
+            auto nearPad = [&](double along) {
+                for (int c = 0; c < 4; c++) if (std::abs(along - c*PP()) <= pad_r) return true;
+                return false;
+            };
+            if (TrenchLine(j) != TrenchLine(j + dj) && !nearPad(i * Pitch())) return 0.0;
+            if (TrenchLine(i) != TrenchLine(i + di) && !nearPad(j * Pitch())) return 0.0;
         }
         double R_bulk  = fNumRsheet->GetNumber();
         double R_sP    = fNumRStripPad->GetNumber();
@@ -762,7 +797,7 @@ public:
                 cacheKey = TString::Format(
                     "PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
                     pp, R_sh, R_sP, R_sM, gap, gap_pad, rin, pad_r);
-            TString cachePath = cacheDir + "/matrix_" + cacheKey + ".root";
+            TString cachePath = cacheDir + "/matrix_" + cacheKey + GridTag() + ".root";
             if (!gSystem->AccessPathName(cachePath.Data())) {  // file exists
                 TFile *fcache = TFile::Open(cachePath.Data(), "READ");
                 if (fcache && !fcache->IsZombie()) {
@@ -785,7 +820,8 @@ public:
                     std::cout << ">>> Matrix saved to cache: " << cachePath << std::endl;
                 }
             }
-            fSolverStatic = new TDecompSparse(); fSolverStatic->SetMatrix(*fMatrixStatic); fSolverStatic->Decompose();
+            fSolverStatic = new RSDSparseSolver(); fSolverStatic->SetMatrix(*fMatrixStatic);
+            ((RSDSparseSolver*)fSolverStatic)->MaxPivoting(); fSolverStatic->Decompose();
             fLastRsheetStat = R_sh; fLastRStripPStat = R_sP; fLastRStripMStat = R_sM; fLastGapStat = gap; fLastGapPadStat = gap_pad; fLastPPStat = pp; fLastTrenchStat = trench; fLastRinStat = rin; fLastPadRadiusStat = pad_r;
             return fSolverStatic;
         } else {
@@ -798,12 +834,14 @@ public:
             if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans && pad_r==fLastPadRTrans && gap_pad==fLastGapPadTrans) return fSolverTrans;
             if (fSolverTrans) delete fSolverTrans; if (fMatrixTrans) delete fMatrixTrans;
             fMatrixTrans = new TMatrixDSparse(nTot, nTot); BuildMatrix(*fMatrixTrans, true, C_node/dt);
-            fSolverTrans = new TDecompSparse(); fSolverTrans->SetMatrix(*fMatrixTrans); fSolverTrans->Decompose();
+            fSolverTrans = new RSDSparseSolver(); fSolverTrans->SetMatrix(*fMatrixTrans);
+            ((RSDSparseSolver*)fSolverTrans)->MaxPivoting(); fSolverTrans->Decompose();
             fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin; fLastPadRTrans = pad_r; fLastGapPadTrans = gap_pad;
             return fSolverTrans;
         }
     }
 
+    // Note: the pad short (G_short = 1e6 S) makes M ill-conditioned; see RSDSparseSolver.
     void BuildMatrix(TMatrixDSparse &M, bool transient, double diagAdd) {
         double R_in = fNumRin->GetNumber();
         bool use_Rin = (R_in > 0);
@@ -1038,7 +1076,7 @@ void DoInjectCharge() {
         CollectCurrents(V, cur, iTot);
         frac.assign(17, 0.0); double tot = 0;
         for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; tot += cur[k]; }
-        for (int k = 1; k <= 16; k++) frac[k] = cur[k]/tot;
+        for (int k = 1; k <= 16; k++) frac[k] = (tot > 0) ? cur[k]/tot : 0.0;
     }
 
     void DoTransient() {
@@ -1145,7 +1183,11 @@ void DoInjectCharge() {
     }
 
     // Batch helper (see RunTransientCheck.C): set pitch, structure, Rsheet, thickness, R_in.
-    // structure: 0 = no structure, 1 = trench.
+    void SetTrenchNoGain(bool b) { fTrenchNoGain = b; }
+    double LastRside() { return fRside; }
+    double LastRdiag() { return fRdiag; }
+
+    // structure: 0 = no structure, 1 = trench, 2 = resistive strip (GUI default strip, 500 Ohm).
     void ConfigureForCheck(double pitch, int structure, double rsheet, double thick, double rin) {
         fNumPixelPitch->SetNumber(pitch);
         fNumRsheet->SetNumber(rsheet);
@@ -1154,6 +1196,8 @@ void DoInjectCharge() {
         fChkNoStruct->SetState(kButtonUp); DoNoStructToggle();
         fChkTrench->SetState(structure == 1 ? kButtonDown : kButtonUp); DoTrenchToggle();
         if (structure == 0) { fChkNoStruct->SetState(kButtonDown); DoNoStructToggle(); }
+        if (structure == 2) { fNumRStripPad->SetNumber(25); fNumRStripMid->SetNumber(25);
+                              fNumStripGap->SetNumber(0); fNumStripGapPad->SetNumber(0); }
     }
 
     void DoMapScanCentral() { RunScan(0); }
@@ -1786,6 +1830,8 @@ void DoSharingTemplates() {
         TVectorD B(nTot); B.Zero();
         double padDirect[17] = {0};
         InjectBilinear(B, x_true, y_true, padDirect);
+        { double wIn = B.Sum(); for (int k = 1; k <= 16; k++) wIn += padDirect[k];
+          if (wIn <= 0) { nSkippedReco++; continue; } }   // hit inside the trench: no gain, no signal
         bool ok; TVectorD V = solver->Solve(B, ok);
 
         std::vector<double> cur(17, 0.0); double iTot = 0;
@@ -1993,7 +2039,7 @@ void DoSharingTemplates() {
 
 void DoResistanceMatrix() {
     SetStatus("  Computing...  ", true);
-    std::cout << "\n>>> Computing inter-electrode resistance (2-terminal, all others floating)..." << std::endl;
+    std::cout << "\n>>> Computing inter-electrode resistance (2-terminal through the electrode disks, all others floating)..." << std::endl;
 
     // Pure 2-terminal measurement: inject 1A into P11, ground only the sink pad.
     // All other 14 pads floating. R = V(P11) - V(sink).
@@ -2011,7 +2057,13 @@ void DoResistanceMatrix() {
     int nodeP7  = padNode(1, 2);  // side neighbor
     int nodeP6  = padNode(1, 1);  // diagonal neighbor
 
-    // Free KCL matrix: no special pad treatment, all nodes follow pure KCL
+    // Free KCL matrix: no electrode boundary condition (all electrodes floating).
+    // The nodes of each electrode disk are shorted together (G_short, as in
+    // BuildMatrix), so the current is injected/extracted through the whole
+    // equipotential electrode of radius a, not through a single node (a point
+    // contact gives a resistance that grows as ln(1/h) with the grid pitch).
+    GetSolver(false);   // makes sure the electrode map matches the geometry
+    const double G_short = 1e6;
     TMatrixDSparse Mfree(nTot, nTot);
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
@@ -2020,7 +2072,8 @@ void DoResistanceMatrix() {
             for (int kk = 0; kk < 4; kk++) {
                 int ni2 = i+di[kk], nj2 = j+dj[kk];
                 if (ni2>=0 && ni2<n && nj2>=0 && nj2<n) {
-                    double cond = GetEdgeConductance(i, j, di[kk], dj[kk]);
+                    int pa = fTypeMap[idx], pb = fTypeMap[ni2*n+nj2];
+                    double cond = (pa > 0 && pa == pb) ? G_short : GetEdgeConductance(i, j, di[kk], dj[kk]);
                     sum_g += cond;
                     Mfree(idx, ni2*n+nj2) = -cond;
                 }
@@ -2038,7 +2091,7 @@ void DoResistanceMatrix() {
     // --- R_side: P11 ↔ P7 ---
     {
         TMatrixDSparse M(Mfree); addWeakRef(M);
-        TDecompSparse sol; sol.SetMatrix(M);
+        RSDSparseSolver sol; sol.SetMatrix(M); sol.MaxPivoting();
         if (!sol.Decompose()) { std::cerr << ">>> ERROR R_side" << std::endl; SetStatus("  Ready  ", false); return; }
         TVectorD B(nTot); B.Zero(); B(nodeP11) = +1.0; B(nodeP7) = -1.0;
         bool ok; TVectorD V = sol.Solve(B, ok);
@@ -2049,13 +2102,14 @@ void DoResistanceMatrix() {
     // --- R_diag: P11 ↔ P6 ---
     {
         TMatrixDSparse M(Mfree); addWeakRef(M);
-        TDecompSparse sol; sol.SetMatrix(M);
+        RSDSparseSolver sol; sol.SetMatrix(M); sol.MaxPivoting();
         if (!sol.Decompose()) { std::cerr << ">>> ERROR R_diag" << std::endl; SetStatus("  Ready  ", false); return; }
         TVectorD B(nTot); B.Zero(); B(nodeP11) = +1.0; B(nodeP6) = -1.0;
         bool ok; TVectorD V = sol.Solve(B, ok);
         R_diag = V(nodeP11) - V(nodeP6);
         printf("  R_diag  P11(2,2) <-> P6(1,1)  = %.1f Ohm\n", R_diag);
     }
+    fRside = R_side; fRdiag = R_diag;
 
     // Bar chart
     if (!cRmat) cRmat = new TCanvas("cRmat", "c6 - Inter-electrode Resistance - Central Pixel", 360, 300);
