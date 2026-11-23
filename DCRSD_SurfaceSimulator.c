@@ -1065,17 +1065,30 @@ void DoInjectCharge() {
         }
     }
 
-    // Static (DC) sharing for a hit at (x,y) [um]; per pad 1..16, normalised to the total.
-    void StaticHit(double x, double y, std::vector<double> &frac) {
+    // Static (DC) electrode currents for a unit charge deposited at (x,y) [um],
+    // per pad 1..16 (charge on the trench, with no gain, is not injected, so the
+    // sum can be below 1). Returns the injected (gain) charge.
+    double StaticCurrents(double x, double y, std::vector<double> &cur) {
         TDecompSparse *solver = GetSolver(false);
         TVectorD B(nTot); B.Zero();
         double padDirect[17] = {0};
         InjectBilinear(B, x, y, padDirect);
+        double wIn = B.Sum(); for (int k = 1; k <= 16; k++) wIn += padDirect[k];
+        cur.assign(17, 0.0);
+        if (wIn <= 0) return 0.0;
         bool ok; TVectorD V = solver->Solve(B, ok);
-        std::vector<double> cur(17, 0.0); double iTot = 0;
+        double iTot = 0;
         CollectCurrents(V, cur, iTot);
+        for (int k = 1; k <= 16; k++) cur[k] += padDirect[k];
+        return wIn;
+    }
+
+    // Static (DC) sharing for a hit at (x,y) [um]; per pad 1..16, normalised to the total.
+    void StaticHit(double x, double y, std::vector<double> &frac) {
+        std::vector<double> cur;
+        StaticCurrents(x, y, cur);
         frac.assign(17, 0.0); double tot = 0;
-        for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; tot += cur[k]; }
+        for (int k = 1; k <= 16; k++) tot += cur[k];
         for (int k = 1; k <= 16; k++) frac[k] = (tot > 0) ? cur[k]/tot : 0.0;
     }
 
@@ -1187,8 +1200,15 @@ void DoInjectCharge() {
     double LastRside() { return fRside; }
     double LastRdiag() { return fRdiag; }
 
-    // structure: 0 = no structure, 1 = trench, 2 = resistive strip (GUI default strip, 500 Ohm).
-    void ConfigureForCheck(double pitch, int structure, double rsheet, double thick, double rin) {
+    // structure: 0 = no structure, 1 = trench, 2 = resistive strip.
+    // rstripTotal [Ohm] is the TOTAL pad-to-pad (centre to centre) strip resistance.
+    // The strip is p/20 wide, i.e. 20 squares, so the strip sheet resistance set in
+    // the panel is rstripTotal/20 [Ohm/sq] (default 500 Ohm = 25 Ohm/sq). The panel
+    // entry is an integer: rstripTotal must be a multiple of 20 Ohm.
+    void ConfigureForCheck(double pitch, int structure, double rsheet, double thick, double rin, double rstripTotal = 500) {
+        const double rstrip = rstripTotal / 20.0;
+        if (structure == 2 && std::abs(rstrip - std::round(rstrip)) > 1e-9)
+            printf("WARNING ConfigureForCheck: R_strip total %.1f Ohm is not a multiple of 20 Ohm; sheet resistance rounded to %.0f Ohm/sq\n", rstripTotal, std::round(rstrip));
         fNumPixelPitch->SetNumber(pitch);
         fNumRsheet->SetNumber(rsheet);
         fNumThick->SetNumber(thick);
@@ -1196,7 +1216,7 @@ void DoInjectCharge() {
         fChkNoStruct->SetState(kButtonUp); DoNoStructToggle();
         fChkTrench->SetState(structure == 1 ? kButtonDown : kButtonUp); DoTrenchToggle();
         if (structure == 0) { fChkNoStruct->SetState(kButtonDown); DoNoStructToggle(); }
-        if (structure == 2) { fNumRStripPad->SetNumber(25); fNumRStripMid->SetNumber(25);
+        if (structure == 2) { fNumRStripPad->SetNumber(rstrip); fNumRStripMid->SetNumber(rstrip);
                               fNumStripGap->SetNumber(0); fNumStripGapPad->SetNumber(0); }
     }
 
