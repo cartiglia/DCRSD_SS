@@ -117,7 +117,7 @@ void PlotSigmaNu(const char* filename, const char* canvasTitle, const char* outP
                   const char* suffix1 = "_sigma", const char* suffix2 = "_nu",
                   const char* yTitle1 = "#sigma_{t-Student} [#mum]", const char* yTitle2 = "#nu_{t-Student}",
                   double yMax1 = -1, double yMax2 = -1, const char* xTitle = "Rin [#Omega]",
-                  double legX1 = 0.18, double legY1 = 0.684)
+                  double legX1 = 0.18, double legY1 = 0.684, bool logY2 = false)
 {
     std::ifstream f(filename);
     if (!f.is_open()) { printf("Cannot open %s\n", filename); return; }
@@ -225,10 +225,12 @@ void PlotSigmaNu(const char* filename, const char* canvasTitle, const char* outP
     mgNu->Draw("A");
     mgNu->GetYaxis()->SetTitleOffset(1.3);
     mgNu->GetYaxis()->CenterTitle(true);
-    mgNu->SetMinimum(0);
-    mgNu->SetMaximum(useMax2);
+    if (logY2) { gPad->SetLogy(); mgNu->SetMinimum(1); mgNu->SetMaximum(useMax2); }
+    else       { mgNu->SetMinimum(0); mgNu->SetMaximum(useMax2); }
     mgNu->GetXaxis()->SetTitleSize(0.045); mgNu->GetYaxis()->SetTitleSize(0.045);
-    TLegend *legN = new TLegend(legX1, legY1, legX1+0.39, legY1+0.14);
+    // with a log nu axis the top-left corner (nu > 40 at low Rin) is empty
+    double lnX = logY2 ? 0.18 : legX1, lnY = logY2 ? 0.70 : legY1;
+    TLegend *legN = new TLegend(lnX, lnY, lnX+0.39, lnY+0.14);
     legN->SetBorderSize(0); legN->SetFillStyle(0); legN->SetTextSize(0.032);
     for (int i = 0; i < nConfig; i++) legN->AddEntry(gNu[i], configs[i].c_str(), "p");
     legN->Draw();
@@ -325,9 +327,9 @@ void PlotStructureScan(const char *d = "sec15_out") {
     PlotSummary(Form("%s/CentralFraction_vs_Rin.txt", d), "Central fraction [%]", Form("%s/centralfraction_vs_rin.png", d));
     PlotSummary(Form("%s/SideFraction_vs_Rin.txt", d), "Central fraction [%]", Form("%s/sidefraction_vs_rin.png", d));
     PlotSigmaNu(Form("%s/UnbalanceFit_vs_Rin.txt", d), "Unbalance reconstruction", Form("%s/unbalance_comparison.png", d),
-                "_sigma", "_nu", "#sigma_{t-Student} [#mum]", "#nu_{t-Student}", 80, 30, "Rin [#Omega]", 0.234, 0.5472);
+                "_sigma", "_nu", "#sigma_{t-Student} [#mum]", "#nu_{t-Student}", 80, 200, "Rin [#Omega]", 0.234, 0.5472, true);
     PlotSigmaNu(Form("%s/TemplateFit_vs_Rin.txt", d), "Template reconstruction", Form("%s/templatefit_vs_rin.png", d),
-                "_sigma", "_nu", "#sigma_{t-Student} [#mum]", "#nu_{t-Student}", 80, 30);
+                "_sigma", "_nu", "#sigma_{t-Student} [#mum]", "#nu_{t-Student}", 80, 200, "Rin [#Omega]", 0.18, 0.684, true);
     PlotSigmaNu(Form("%s/InterpadResistance_vs_Rin.txt", d), "Inter-pad resistance", Form("%s/interpadresistance_vs_rin.png", d),
                 "_Rside", "_Rdiag", "R_{side} [#Omega]", "R_{diag} [#Omega]");
 
